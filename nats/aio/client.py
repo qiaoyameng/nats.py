@@ -112,6 +112,35 @@ class RawCredentials(UserString):
 Credentials = Union[str, Tuple[str, str], RawCredentials, Path]
 
 
+# Default ports per scheme, used to normalize server addresses so that
+# e.g. "nats://host" and "host:4222" are considered the same server.
+DEFAULT_SCHEME_PORTS = {
+    "nats": 4222,
+    "tls": 4222,
+    "ws": 80,
+    "wss": 443,
+}
+
+
+def _server_identity(uri: ParseResult) -> Tuple[str, str, int]:
+    """
+    Returns a normalized identity for a server URI so that addresses
+    referring to the same server compare equal.  Normalization covers
+    the scheme (defaulting to nats), the hostname (lowercased and with
+    IPv6 brackets stripped by urlparse) and the port (defaulting to the
+    scheme's default port).  Userinfo is intentionally excluded so that
+    credentials never become part of a server's identity.
+    """
+    scheme = uri.scheme or "nats"
+    try:
+        port = uri.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = DEFAULT_SCHEME_PORTS.get(scheme, 4222)
+    return (scheme, uri.hostname or "", port)
+
+
 @dataclass
 class Srv:
     """
@@ -125,6 +154,10 @@ class Srv:
     discovered: bool = False
     tls_name: Optional[str] = None
     server_version: Optional[str] = None
+
+    @property
+    def identity(self) -> Tuple[str, str, int]:
+        return _server_identity(self.uri)
 
 
 class ServerVersion:
@@ -341,6 +374,7 @@ class Client:
         ping_interval: int = DEFAULT_PING_INTERVAL,
         max_outstanding_pings: int = DEFAULT_MAX_OUTSTANDING_PINGS,
         dont_randomize: bool = False,
+        prune_discovered_servers: bool = False,
         flusher_queue_size: int = DEFAULT_MAX_FLUSHER_QUEUE_SIZE,
         no_echo: bool = False,
         tls: Optional[ssl.SSLContext] = None,
@@ -369,6 +403,14 @@ class Client:
         :param disconnected_cb: Callback to report disconnection from NATS.
         :param closed_cb: Callback to report when client stops reconnection to NATS.
         :param discovered_server_cb: Callback to report when a new server joins the cluster.
+        :param prune_discovered_servers: When enabled, the latest INFO update from
+            the server replaces the set of discovered servers: discovered servers
+            that are no longer advertised are removed from the server pool, while
+            explicitly configured seed servers are always kept. The connection in
+            use is never interrupted, but a removed server stops being a reconnect
+            candidate. A server that reappears in a later INFO is re-added as a
+            freshly discovered server (reconnect attempts, reconnect wait and TLS
+            server name state are reset).
         :param pending_size: Max size of the pending buffer for publishing commands.
         :param flush_timeout: Max duration to wait for a forced flush to occur.
 
@@ -485,6 +527,7 @@ class Client:
         self.options["name"] = name
         self.options["allow_reconnect"] = allow_reconnect
         self.options["dont_randomize"] = dont_randomize
+        self.options["prune_discovered_servers"] = prune_discovered_servers
         self.options["reconnect_time_wait"] = reconnect_time_wait
         self.options["max_reconnect_attempts"] = max_reconnect_attempts
         self.options["ping_interval"] = ping_interval
@@ -1908,42 +1951,69 @@ class Client:
         with latest updates from cluster to enable server discovery.
         """
         assert self._current_server, "Client.connect must be called first"
-        if "connect_urls" in info:
-            if info["connect_urls"]:
-                connect_urls = []
-                for connect_url in info["connect_urls"]:
-                    scheme = ""
-                    if self._current_server.uri.scheme == "tls":
-                        scheme = "tls"
-                    else:
-                        scheme = "nats"
+        if "connect_urls" not in info:
+            return
 
-                    uri = urlparse(f"{scheme}://{connect_url}")
-                    srv = Srv(uri)
-                    srv.discovered = True
+        connect_urls = info["connect_urls"]
+        prune = self.options.get("prune_discovered_servers", False)
+        if not connect_urls and not prune:
+            return
 
-                    # Check whether we should reuse the original hostname.
-                    if ("tls_required" in self._server_info
-                            and self._server_info["tls_required"]
-                            and self._host_is_ip(uri.hostname)):
-                        srv.tls_name = self._current_server.uri.hostname
+        # Build the set of servers advertised by the latest INFO,
+        # normalized and de-duplicated by server identity so that
+        # equivalent addresses (IPv6, default ports, userinfo, scheme)
+        # are only considered once.
+        advertised: Dict[Tuple[str, str, int], Srv] = {}
+        for connect_url in connect_urls:
+            if self._current_server.uri.scheme == "tls":
+                scheme = "tls"
+            else:
+                scheme = "nats"
 
-                    # Filter for any similar server in the server pool already.
-                    should_add = True
-                    for s in self._server_pool:
-                        if uri.netloc == s.uri.netloc:
-                            should_add = False
-                    if should_add:
-                        connect_urls.append(srv)
+            uri = urlparse(f"{scheme}://{connect_url}")
+            srv = Srv(uri)
+            srv.discovered = True
 
-                if self.options["dont_randomize"] is not True:
-                    shuffle(connect_urls)
-                for srv in connect_urls:
-                    self._server_pool.append(srv)
+            # Check whether we should reuse the original hostname.
+            if ("tls_required" in self._server_info
+                    and self._server_info["tls_required"]
+                    and self._host_is_ip(uri.hostname)):
+                srv.tls_name = self._current_server.uri.hostname
 
-                if (not initial_connection and connect_urls
-                        and self._discovered_server_cb):
-                    await self._discovered_server_cb()
+            advertised.setdefault(srv.identity, srv)
+
+        # Filter out servers already present in the server pool.
+        pool_identities = {srv.identity for srv in self._server_pool}
+        new_servers = [
+            srv for identity, srv in advertised.items()
+            if identity not in pool_identities
+        ]
+
+        removed = False
+        if prune:
+            # The latest INFO replaces the set of discovered servers:
+            # explicitly configured seeds are always kept, discovered
+            # servers no longer advertised are dropped from the pool.
+            # The server the client is currently using is dropped from
+            # the pool as well so it stops being a reconnect candidate,
+            # but the active connection itself is left untouched.
+            kept = []
+            for srv in self._server_pool:
+                if not srv.discovered or srv.identity in advertised:
+                    kept.append(srv)
+                else:
+                    removed = True
+            self._server_pool = kept
+
+        if self.options["dont_randomize"] is not True:
+            shuffle(new_servers)
+        for srv in new_servers:
+            self._server_pool.append(srv)
+
+        # Notify only when the effective set of candidates changed.
+        if (not initial_connection and (new_servers or removed)
+                and self._discovered_server_cb):
+            await self._discovered_server_cb()
 
     def _host_is_ip(self, connect_url: Optional[str]) -> bool:
         if connect_url is None:
