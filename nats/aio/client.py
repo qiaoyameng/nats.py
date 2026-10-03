@@ -768,10 +768,8 @@ class Client:
         # to replay the subscriptions anymore.
         for sub in self._subs.values():
             # Async subs use join when draining already so just cancel here.
-            if sub._wait_for_msgs_task and not sub._wait_for_msgs_task.done():
-                sub._wait_for_msgs_task.cancel()
-            if sub._message_iterator:
-                sub._message_iterator._cancel()
+            # This also releases any keyed dispatch worker tasks.
+            sub._stop_processing()
             # Sync subs may have some inflight next_msg calls that could be blocking
             # so cancel them here to unblock them.
             if sub._pending_next_msgs_calls:
@@ -964,6 +962,8 @@ class Client:
         max_msgs: int = 0,
         pending_msgs_limit: int = DEFAULT_SUB_PENDING_MSGS_LIMIT,
         pending_bytes_limit: int = DEFAULT_SUB_PENDING_BYTES_LIMIT,
+        cb_key: Optional[Callable[[Msg], Any]] = None,
+        cb_concurrency: int = 1,
     ) -> Subscription:
         """
         subscribe registers interest in a given subject.
@@ -972,6 +972,16 @@ class Client:
 
         If a callback isn't provided, messages can be retrieved via an
         asynchronous iterator on the returned subscription object.
+
+        :param cb_key: Optional function that maps each message to a key.
+            When provided, messages with different keys may have their
+            callbacks running in parallel while messages with the same key
+            are still processed one by one in reception order. Failures of
+            the key function or of the message callback are reported to the
+            connection error callback without stalling the other keys.
+        :param cb_concurrency: Maximum number of message callbacks allowed
+            to run concurrently when `cb_key` is used. Defaults to 1, which
+            preserves the regular serial callback behavior.
         """
         if not subject or (" " in subject):
             raise errors.BadSubjectError
@@ -998,6 +1008,8 @@ class Client:
             max_msgs=max_msgs,
             pending_msgs_limit=pending_msgs_limit,
             pending_bytes_limit=pending_bytes_limit,
+            cb_key=cb_key,
+            cb_concurrency=cb_concurrency,
         )
 
         sub._start(self._error_cb)
@@ -1834,6 +1846,22 @@ class Client:
                     # so it would not be pending data.
                     sub._pending_size -= payload_size
 
+                    await self._error_cb(
+                        errors.SlowConsumerError(
+                            subject=msg.subject,
+                            reply=msg.reply,
+                            sid=sid,
+                            sub=sub
+                        )
+                    )
+                    return
+                # With keyed concurrent callbacks, messages already
+                # dispatched to a per-key worker still count as pending,
+                # so check the total (queued + inflight) against the
+                # pending messages limit instead of only the queue size.
+                if (sub._pending_inflight > 0
+                        and sub.pending_msgs >= sub._pending_msgs_limit):
+                    sub._pending_size -= payload_size
                     await self._error_cb(
                         errors.SlowConsumerError(
                             subject=msg.subject,

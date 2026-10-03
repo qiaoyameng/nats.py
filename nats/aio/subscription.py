@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 from typing import (
     TYPE_CHECKING,
+    Any,
     AsyncIterator,
     Awaitable,
     Callable,
+    Dict,
     List,
     Optional,
 )
@@ -70,6 +72,8 @@ class Subscription:
         max_msgs: int = 0,
         pending_msgs_limit: int = DEFAULT_SUB_PENDING_MSGS_LIMIT,
         pending_bytes_limit: int = DEFAULT_SUB_PENDING_BYTES_LIMIT,
+        cb_key: Optional[Callable[[Msg], Any]] = None,
+        cb_concurrency: int = 1,
     ) -> None:
         self._conn = conn
         self._id = id
@@ -96,6 +100,28 @@ class Subscription:
         self._pending_size = 0
         self._wait_for_msgs_task = None
         self._message_iterator = None
+
+        # Optional keyed concurrent callback dispatch. When a `cb_key`
+        # function is given, messages are fanned out to per-key workers:
+        # messages with different keys may run their callbacks in parallel
+        # (up to `cb_concurrency` at a time) while messages with the same
+        # key are always processed in the order they were received.
+        if cb_key is not None and cb is None:
+            raise errors.Error(
+                "nats: cb_key requires a subscription callback"
+            )
+        if cb_concurrency < 1:
+            raise errors.Error(
+                "nats: cb_concurrency must be at least 1"
+            )
+        self._cb_key = cb_key
+        self._cb_concurrency = cb_concurrency
+        self._key_queues: Dict[Any, asyncio.Queue] = {}
+        self._key_workers: Dict[Any, asyncio.Task] = {}
+        # Messages already taken from the pending queue by the dispatcher
+        # but not fully processed yet. They still count as pending so that
+        # queued work is not hidden from the pending limits accounting.
+        self._pending_inflight = 0
 
         # For JetStream enabled subscriptions.
         self._jsi: Optional[JetStreamContext._JSI] = None
@@ -142,8 +168,13 @@ class Subscription:
         """
         Number of delivered messages by the NATS Server that are being buffered
         in the pending queue.
+
+        When keyed concurrent callbacks are enabled, messages that have been
+        dispatched to a per-key queue but not processed yet are included as
+        well: they are still held by the subscription and keep counting
+        against the pending limits.
         """
-        return self._pending_queue.qsize()
+        return self._pending_queue.qsize() + self._pending_inflight
 
     @property
     def pending_bytes(self) -> int:
@@ -219,9 +250,12 @@ class Subscription:
                     "nats: must use coroutine for subscriptions"
                 )
 
-            self._wait_for_msgs_task = asyncio.get_running_loop().create_task(
-                self._wait_for_msgs(error_cb)
-            )
+            if self._cb_key is not None:
+                self._wait_for_msgs_task = asyncio.get_running_loop(
+                ).create_task(self._wait_for_msgs_keyed(error_cb))
+            else:
+                self._wait_for_msgs_task = asyncio.get_running_loop(
+                ).create_task(self._wait_for_msgs(error_cb))
 
         elif self._future:
             # Used to handle the single response from a request.
@@ -232,6 +266,11 @@ class Subscription:
     async def drain(self):
         """
         Removes interest in a subject, but will process remaining messages.
+
+        Waits until every message that was already accepted into the pending
+        queue has been fully processed by the callback. With keyed concurrent
+        callbacks this includes messages sitting in per-key queues and the
+        ones currently running their callback.
         """
         if self._conn.is_closed:
             raise errors.ConnectionClosedError
@@ -272,9 +311,15 @@ class Subscription:
 
         Removes interest in a subject, remaining messages will be discarded.
 
+        Without a `limit` this stops processing immediately: the dispatcher
+        and any per-key callback workers are cancelled and buffered messages
+        are dropped.
+
         If `limit` is greater than zero, interest is not immediately removed,
         rather, interest will be automatically removed after `limit` messages
-        are received.
+        are received. Messages already accepted into the pending queue by
+        then are still processed to completion before the subscription
+        finishes.
         """
         if self._conn.is_closed:
             raise errors.ConnectionClosedError
@@ -285,7 +330,7 @@ class Subscription:
 
         self._max_msgs = limit
         if limit == 0 or (self._received >= limit
-                          and self._pending_queue.empty()):
+                          and self.pending_msgs == 0):
             self._closed = True
             self._stop_processing()
             self._conn._remove_sub(self._id)
@@ -299,6 +344,9 @@ class Subscription:
         """
         if self._wait_for_msgs_task and not self._wait_for_msgs_task.done():
             self._wait_for_msgs_task.cancel()
+        for worker in self._key_workers.values():
+            if not worker.done():
+                worker.cancel()
         if self._message_iterator:
             self._message_iterator._cancel()
 
@@ -336,6 +384,148 @@ class Subscription:
                     self._stop_processing()
             except asyncio.CancelledError:
                 break
+
+    async def _wait_for_msgs_keyed(self, error_cb) -> None:
+        """
+        Dispatcher coroutine used when a `cb_key` function is provided.
+
+        Takes messages from the pending queue and hands them over to a
+        per-key worker. Messages with different keys are processed in
+        parallel, up to `_cb_concurrency` workers at a time, while messages
+        sharing a key are processed one by one in reception order.
+
+        Pending accounting (pending bytes and the `task_done` marker used
+        by drain) is only settled once a message has been fully processed,
+        so messages waiting in per-key queues keep counting against the
+        pending limits instead of disappearing from them.
+        """
+        assert self._cb and self._cb_key, \
+            "_wait_for_msgs_keyed requires both cb and cb_key"
+        try:
+            while True:
+                msg = await self._pending_queue.get()
+                self._pending_inflight += 1
+                try:
+                    try:
+                        key = self._cb_key(msg)
+                        # Keys are used as dictionary keys by the
+                        # dispatcher, so reject unhashable ones early.
+                        hash(key)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # A failing key function is reported through the
+                        # error callback and only drops this message, it
+                        # must not stall the other keys.
+                        if error_cb:
+                            await error_cb(e)
+                        self._finish_keyed_msg(msg)
+                        msg = None
+                        continue
+
+                    worker = self._key_workers.get(key)
+                    while worker is None:
+                        if len(self._key_workers) < self._cb_concurrency:
+                            worker = self._spawn_key_worker(key, error_cb)
+                        else:
+                            # All callback slots are busy: wait for any key
+                            # worker to become idle before dispatching more
+                            # messages. The message keeps counting as
+                            # pending while it is held here.
+                            await asyncio.wait(
+                                set(self._key_workers.values()),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            worker = self._key_workers.get(key)
+                    self._key_queues[key].put_nowait(msg)
+                    # The key worker owns the message from now on.
+                    msg = None
+
+                    # Apply auto unsubscribe checks once everything received
+                    # has been dispatched, then wait for the accepted
+                    # messages to be processed below.
+                    if (self._max_msgs > 0
+                            and self._received >= self._max_msgs
+                            and self._pending_queue.empty()):
+                        break
+                finally:
+                    if msg is not None:
+                        self._finish_keyed_msg(msg)
+        except asyncio.CancelledError:
+            # Immediate stop (unsubscribe without limit or connection
+            # close): the key workers are cancelled separately via
+            # `_stop_processing` and release whatever they still hold.
+            return
+
+        # Auto unsubscribe limit reached: no more messages will arrive, so
+        # wait until the already accepted ones have been processed.
+        if self._key_workers:
+            await asyncio.gather(
+                *self._key_workers.values(), return_exceptions=True
+            )
+
+    def _spawn_key_worker(self, key, error_cb) -> asyncio.Task:
+        """
+        Creates the queue and worker task dedicated to a key.
+        """
+        queue: asyncio.Queue[Msg] = asyncio.Queue()
+        self._key_queues[key] = queue
+        worker = asyncio.get_running_loop().create_task(
+            self._key_worker(key, error_cb)
+        )
+        self._key_workers[key] = worker
+        return worker
+
+    async def _key_worker(self, key, error_cb) -> None:
+        """
+        Processes the messages of a single key one at a time, in order.
+
+        The worker exits once its queue is empty, freeing its concurrency
+        slot for other keys. The empty check and the unregistration happen
+        without awaiting in between, so the dispatcher can never enqueue a
+        message into a queue whose worker has already gone away.
+        """
+        queue = self._key_queues[key]
+        try:
+            while True:
+                try:
+                    msg = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await self._cb(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Callback failures are reported through the error
+                    # callback; the key keeps making progress with its
+                    # next message and other keys are unaffected.
+                    if error_cb:
+                        await error_cb(e)
+                finally:
+                    self._finish_keyed_msg(msg)
+        finally:
+            # On cancellation (unsubscribe or connection close) release
+            # whatever is still queued for this key so that the pending
+            # accounting does not leak.
+            while True:
+                try:
+                    msg = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._finish_keyed_msg(msg)
+            current = asyncio.current_task()
+            if self._key_workers.get(key) is current:
+                self._key_workers.pop(key, None)
+                self._key_queues.pop(key, None)
+
+    def _finish_keyed_msg(self, msg: Msg) -> None:
+        """
+        Settles the pending accounting of a dispatched message.
+        """
+        self._pending_inflight -= 1
+        self._pending_size -= len(msg.data)
+        self._pending_queue.task_done()
 
 
 class _SubscriptionMessageIterator:
