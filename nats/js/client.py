@@ -161,8 +161,7 @@ class JetStreamContext(JetStreamManager):
             return
 
         # Handle no responders
-        if msg.headers and msg.headers.get(api.Header.STATUS
-                                           ) == NO_RESPONDERS_STATUS:
+        if msg.status == NO_RESPONDERS_STATUS:
             future.set_exception(nats.js.errors.NoStreamResponseError)
             return
 
@@ -698,9 +697,9 @@ class JetStreamContext(JetStreamManager):
 
     @classmethod
     def is_status_msg(cls, msg: Optional[Msg]) -> Optional[str]:
-        if msg is None or msg.headers is None:
+        if msg is None:
             return None
-        return msg.headers.get(api.Header.STATUS)
+        return msg.status
 
     @classmethod
     def _is_processable_msg(cls, status: Optional[str], msg: Msg) -> bool:

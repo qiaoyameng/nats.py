@@ -427,7 +427,7 @@ class JetStreamManager:
     def _lift_msg_to_raw_msg(self, msg) -> api.RawStreamMsg:
         if not msg.data:
             msg.data = None
-            status = msg.headers.get("Status")
+            status = msg.status
             if status:
                 if status == "404":
                     raise NotFoundError

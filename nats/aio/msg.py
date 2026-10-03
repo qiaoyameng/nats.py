@@ -16,7 +16,9 @@ from __future__ import annotations
 import datetime
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
+
+from nats.aio.headers import Headers
 
 from nats.errors import Error, MsgAlreadyAckdError, NotJSMessageError
 
@@ -45,7 +47,8 @@ class Msg:
     subject: str = ""
     reply: str = ""
     data: bytes = b""
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[Headers] = None
+    raw_headers: Optional[bytes] = None
 
     _metadata: Optional[Metadata] = None
     _ackd: bool = False
@@ -71,11 +74,19 @@ class Msg:
         NumPending = 10
 
     @property
-    def header(self) -> Optional[Dict[str, str]]:
+    def header(self) -> Optional[Headers]:
         """
         header returns the headers from a message.
         """
         return self.headers
+
+    @property
+    def status(self) -> Optional[str]:
+        return self.headers.status if self.headers is not None else None
+
+    @property
+    def description(self) -> Optional[str]:
+        return self.headers.description if self.headers is not None else None
 
     @property
     def is_acked(self) -> bool:
@@ -102,7 +113,9 @@ class Msg:
         if not self._client:
             raise Error("client not set")
 
-        await self._client.publish(self.reply, data, headers=self.headers)
+        await self._client.publish(
+            self.reply, data, headers=self.raw_headers or self.headers
+        )
 
     async def ack(self) -> None:
         """

@@ -167,6 +167,53 @@ class ProtocolParserTest(unittest.TestCase):
         self.assertEqual(len(nc._server_info["server_id"]), 2048)
 
     @async_test
+    async def test_parse_invalid_header_does_not_drop_next_message(self):
+        from nats.aio.client import Client
+
+        class HeaderMockNatsClient(MockNatsClient):
+            def __init__(self):
+                super().__init__()
+                self.received = []
+
+            async def _error_cb(self, error):
+                pass
+
+        nc = HeaderMockNatsClient()
+
+        async def payload_test(sid, subject, reply, payload, headers=None):
+            nc.received.append((payload, headers))
+
+        params = {
+            "subject": "hello",
+            "queue": None,
+            "cb": payload_test,
+            "future": None,
+        }
+        sub = Subscription(nc, 1, **params)
+        nc._subs[1] = sub
+
+        async def process_msg(sid, subject, reply, payload, headers=None):
+            parsed = await Client._process_headers(nc, headers)
+            if headers is not None and parsed is None:
+                return
+            await sub._cb(sid, subject, reply, payload, headers)
+
+        nc._process_msg = process_msg
+
+        bad_headers = b"NATS/1.0\r\nBad Header\r\n\r\n"
+        data = (
+            f"HMSG hello 1 {len(bad_headers)} {len(bad_headers) + 4}\r\n"
+            .encode()
+            + bad_headers
+            + b"bad!\r\n"
+            + b"MSG hello 1 3\r\nabc\r\n"
+        )
+        parser = Parser(nc)
+        await parser.parse(data)
+
+        self.assertEqual(nc.received, [(b"abc", None)])
+
+    @async_test
     async def test_parse_msg_long_subject_reply(self):
         nc = MockNatsClient()
 

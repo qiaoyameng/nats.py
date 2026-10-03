@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+from nats.aio.headers import Headers
 from nats.aio.msg import Msg
 
 ERROR_HEADER = "Nats-Service-Error"
@@ -36,7 +37,7 @@ class Request:
         return self._msg.subject
 
     @property
-    def headers(self) -> Optional[Dict[str, str]]:
+    def headers(self) -> Optional[Headers]:
         """The headers of the request."""
         return self._msg.headers
 

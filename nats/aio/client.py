@@ -21,22 +21,15 @@ import json
 import logging
 import re
 import ssl
-import string
 import time
 from collections import UserString
 from dataclasses import dataclass
-from email.parser import BytesParser
 from io import BytesIO
 from pathlib import Path
 from random import shuffle
 from secrets import token_hex
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import ParseResult, urlparse
-
-try:
-    from fast_mail_parser import parse_email
-except ImportError:
-    parse_email = None
 
 import nats.js
 from nats import errors
@@ -51,6 +44,7 @@ from nats.protocol.parser import (
 )
 
 from .errors import ErrInvalidUserCredentials, ErrStaleConnection
+from .headers import Headers, headers_from_wire, parse_headers
 from .msg import Msg
 from .subscription import (
     DEFAULT_SUB_PENDING_BYTES_LIMIT,
@@ -71,9 +65,7 @@ PONG_OP = b"PONG"
 OK_OP = b"+OK"
 ERR_OP = b"-ERR"
 _CRLF_ = b"\r\n"
-_CRLF_LEN_ = len(_CRLF_)
 _SPC_ = b" "
-_SPC_BYTE_ = 32
 EMPTY = ""
 
 PING_PROTO = PING_OP + _CRLF_
@@ -93,12 +85,8 @@ DEFAULT_CONNECT_TIMEOUT = 2  # in seconds
 DEFAULT_DRAIN_TIMEOUT = 30  # in seconds
 MAX_CONTROL_LINE_SIZE = 1024
 
-NATS_HDR_LINE = bytearray(b"NATS/1.0")
-NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
 NO_RESPONDERS_STATUS = "503"
 CTRL_STATUS = "100"
-STATUS_MSG_LEN = 3  # e.g. 20x, 40x, 50x
-
 Callback = Callable[[], Awaitable[None]]
 ErrorCallback = Callable[[Exception], Awaitable[None]]
 JWTCallback = Callable[[], Union[bytearray, bytes]]
@@ -285,7 +273,6 @@ class Client:
         self._flush_queue: Optional[asyncio.Queue[asyncio.Future[Any]]] = None
         self._flusher_task: Optional[asyncio.Task] = None
         self._flush_timeout: Optional[float] = 0
-        self._hdr_parser: BytesParser = BytesParser()
 
         # New style request/response
         self._resp_map: Dict[str, asyncio.Future] = {}
@@ -847,7 +834,7 @@ class Client:
         subject: str,
         payload: bytes = b"",
         reply: str = "",
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[Any] = None,
     ) -> None:
         """
         Publishes a NATS message.
@@ -920,7 +907,7 @@ class Client:
         reply: str,
         payload: bytes,
         payload_size: int,
-        headers: Optional[Dict[str, Any]],
+        headers: Optional[Any],
     ) -> None:
         """
         Sends PUB command to the NATS server.
@@ -933,20 +920,7 @@ class Client:
         if headers is None:
             pub_cmd = prot_command.pub_cmd(subject, reply, payload)
         else:
-            hdr = bytearray()
-            hdr.extend(NATS_HDR_LINE)
-            hdr.extend(_CRLF_)
-            for k, v in headers.items():
-                key = k.strip()
-                if not key:
-                    # Skip empty keys
-                    continue
-                hdr.extend(key.encode())
-                hdr.extend(b": ")
-                value = v.strip()
-                hdr.extend(value.encode())
-                hdr.extend(_CRLF_)
-            hdr.extend(_CRLF_)
+            hdr = self._encode_headers(headers)
             pub_cmd = prot_command.hpub_cmd(subject, reply, hdr, payload)
 
         self.stats["out_msgs"] += 1
@@ -1063,8 +1037,7 @@ class Client:
             msg = await self._request_new_style(
                 subject, payload, timeout=timeout, headers=headers
             )
-        if (msg.headers and msg.headers.get(nats.js.api.Header.STATUS)
-                == NO_RESPONDERS_STATUS):
+        if msg.status == NO_RESPONDERS_STATUS:
             raise errors.NoRespondersError
         return msg
 
@@ -1140,10 +1113,8 @@ class Client:
 
         try:
             msg = await asyncio.wait_for(future, timeout)
-            if msg.headers:
-                if msg.headers.get(nats.js.api.Header.STATUS
-                                   ) == NO_RESPONDERS_STATUS:
-                    raise errors.NoRespondersError
+            if msg.status == NO_RESPONDERS_STATUS:
+                raise errors.NoRespondersError
             return msg
         except asyncio.TimeoutError:
             await sub.unsubscribe()
@@ -1646,101 +1617,48 @@ class Client:
             self._pongs_received += 1
             self._pings_outstanding = 0
 
-    def _is_control_message(self, data, header: Dict[str,
-                                                     str]) -> Optional[str]:
+    def _is_control_message(self, data, header: Headers) -> Optional[str]:
         if len(data) > 0:
             return None
-        status = header.get(nats.js.api.Header.STATUS)
-        if status == CTRL_STATUS:
-            return header.get(nats.js.api.Header.DESCRIPTION)
+        if header.status == CTRL_STATUS:
+            return header.description
         return None
 
-    async def _process_headers(self, headers) -> Optional[Dict[str, str]]:
+    @staticmethod
+    def _encode_headers(headers: Any) -> bytes:
+        if isinstance(headers, (bytes, bytearray, memoryview)):
+            encoded = bytes(headers)
+            parse_headers(encoded)
+            return encoded
+        if isinstance(headers, Headers):
+            return headers.to_wire()
+
+        encoded = Headers()
+        if hasattr(headers, "multi_items"):
+            items = headers.multi_items()
+        elif hasattr(headers, "items"):
+            items = headers.items()
+        else:
+            items = headers
+        for key, value in items:
+            key = key.strip()
+            if not key:
+                continue
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    encoded.add(key, str(item).strip())
+            else:
+                encoded.add(key, str(value).strip())
+        return encoded.to_wire()
+
+    async def _process_headers(self, headers: bytes) -> Optional[Headers]:
         if not headers:
             return None
-
-        hdr: Optional[Dict[str, str]] = None
-        raw_headers = headers[NATS_HDR_LINE_SIZE:]
-
-        # If the first character is an empty space, then this is
-        # an inline status message sent by the server.
-        #
-        # NATS/1.0 404\r\n\r\n
-        # NATS/1.0 503\r\n\r\n
-        # NATS/1.0 404 No Messages\r\n\r\n
-        #
-        # Note: it is possible to receive a message with both inline status
-        # and a set of headers.
-        #
-        # NATS/1.0 100\r\nIdle Heartbeat\r\nNats-Last-Consumer: 1016\r\nNats-Last-Stream: 1024\r\n\r\n
-        #
-        if raw_headers[0] == _SPC_BYTE_:
-            # Special handling for status messages.
-            line = headers[len(NATS_HDR_LINE) + 1:]
-            status = line[:STATUS_MSG_LEN]
-            desc = line[STATUS_MSG_LEN + 1:len(line) - _CRLF_LEN_ - _CRLF_LEN_]
-            stripped_status = status.strip().decode()
-
-            # Process as status only when it is a valid integer.
-            hdr = {}
-            if stripped_status.isdigit():
-                hdr[nats.js.api.Header.STATUS.value] = stripped_status
-
-            # Move the raw_headers to end of line
-            i = raw_headers.find(_CRLF_)
-            raw_headers = raw_headers[i + _CRLF_LEN_:]
-
-            if len(desc) > 0:
-                # Heartbeat messages can have both headers and inline status,
-                # check that there are no pending headers to be parsed.
-                i = desc.find(_CRLF_)
-                if i > 0:
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc[:i].decode()
-                    parsed_hdr = self._hdr_parser.parsebytes(
-                        desc[i + _CRLF_LEN_:]
-                    )
-                    for k, v in parsed_hdr.items():
-                        hdr[k] = v
-                else:
-                    # Just inline status...
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc.decode()
-
-        if not len(raw_headers) > _CRLF_LEN_:
-            return hdr
-
-        #
-        # Example header without status:
-        #
-        # NATS/1.0\r\nfoo: bar\r\nhello: world
-        #
-        raw_headers = headers[NATS_HDR_LINE_SIZE + _CRLF_LEN_:]
         try:
-            if parse_email:
-                parsed_hdr = parse_email(raw_headers).headers
-            else:
-                parsed_hdr = {
-                    k.strip(): v.strip()
-                    for k, v in self._hdr_parser.parsebytes(raw_headers
-                                                            ).items()
-                }
-            if hdr:
-                hdr.update(parsed_hdr)
-            else:
-                hdr = parsed_hdr
-
-            if parse_email:
-                to_delete = []
-                for k in hdr.keys():
-                    if any(c in k for c in string.whitespace):
-                        to_delete.append(k)
-                for k in to_delete:
-                    del hdr[k]
-
-        except Exception as e:
+            return headers_from_wire(headers)
+        except (UnicodeError, ValueError) as e:
             await self._error_cb(e)
-            return hdr
-
-        return hdr or None
+            return None
 
     async def _process_msg(
         self,
@@ -1771,7 +1689,9 @@ class Client:
             self._subs.pop(sid, None)
 
         hdr = await self._process_headers(headers)
-        msg = self._build_message(sid, subject, reply, data, hdr)
+        if headers is not None and hdr is None:
+            return
+        msg = self._build_message(sid, subject, reply, data, hdr, headers)
         if not msg:
             return
 
@@ -1882,13 +1802,15 @@ class Client:
         subject: bytes,
         reply: bytes,
         data: bytes,
-        headers: Optional[Dict[str, str]],
+        headers: Optional[Headers],
+        raw_headers: Optional[bytes] = None,
     ):
         return self.msg_class(
             subject=subject.decode(),
             reply=reply.decode(),
             data=data,
             headers=headers,
+            raw_headers=raw_headers,
             _client=self,
             _sid=sid,
         )

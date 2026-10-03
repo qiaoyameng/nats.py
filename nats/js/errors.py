@@ -67,14 +67,15 @@ class APIError(Error):
 
     @classmethod
     def from_msg(cls, msg: Msg) -> NoReturn:
-        if msg.header is None:
+        code = msg.status
+        if code is None:
             raise APIError
-        code = msg.header[api.Header.STATUS]
         if code == api.StatusCode.SERVICE_UNAVAILABLE:
             raise ServiceUnavailableError
         else:
-            desc = msg.header[api.Header.DESCRIPTION]
-            raise APIError(code=int(code), description=desc)
+            raise APIError(
+                code=int(code), description=msg.description
+            )
 
     @classmethod
     def from_error(cls, err: Dict[str, Any]):

@@ -18,7 +18,7 @@ def pub_cmd(subject, reply, payload) -> bytes:
     )
 
 
-def hpub_cmd(subject, reply, hdr, payload) -> bytes:
+def hpub_cmd(subject, reply, hdr: bytes, payload: bytes) -> bytes:
     hdr_len = len(hdr)
     total_size = len(payload) + hdr_len
     return (
