@@ -199,9 +199,23 @@ class Parser:
                         del self.buf[:self.needed + CRLF_SIZE]
 
                     self.state = AWAITING_CONTROL_LINE
-                    await self.nc._process_msg(
-                        sid, subject, reply, payload, hdr
-                    )
+                    # Keep parsing any further messages already present in
+                    # this read chunk even if dispatching this message fails
+                    # (for example because of malformed headers): one bad
+                    # message must not swallow the valid messages behind it.
+                    try:
+                        await self.nc._process_msg(
+                            sid, subject, reply, payload, hdr
+                        )
+                    except Exception as err:
+                        # Report dispatch/header failures, then keep going:
+                        # one bad message must not swallow the valid messages
+                        # already present in this same read chunk.
+                        err_cb = getattr(self.nc, "_error_cb", None)
+                        if err_cb is None:
+                            raise
+                        await err_cb(err)
+                    continue
                 else:
                     # Wait until we have enough bytes in buffer.
                     break

@@ -16,20 +16,15 @@ from __future__ import annotations
 
 import base64
 import json
-from email.parser import BytesParser
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
+from nats.aio.headers import Headers
 from nats.errors import NoRespondersError
 from nats.js import api
 from nats.js.errors import APIError, NotFoundError, ServiceUnavailableError
 
 if TYPE_CHECKING:
     from nats import NATS
-
-NATS_HDR_LINE = bytearray(b"NATS/1.0")
-NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
-_CRLF_ = b"\r\n"
-_CRLF_LEN_ = len(_CRLF_)
 
 
 class JetStreamManager:
@@ -46,7 +41,6 @@ class JetStreamManager:
         self._prefix = prefix
         self._nc = conn
         self._timeout = timeout
-        self._hdr_parser = BytesParser()
 
     async def account_info(self) -> api.AccountInfo:
         resp = await self._api_request(
@@ -407,14 +401,7 @@ class JetStreamManager:
         raw_msg = api.RawStreamMsg.from_response(resp_data["message"])
         if raw_msg.hdrs:
             hdrs = base64.b64decode(raw_msg.hdrs)
-            raw_headers = hdrs[NATS_HDR_LINE_SIZE + _CRLF_LEN_:]
-            parsed_headers = self._hdr_parser.parsebytes(raw_headers)
-            headers = None
-            if len(parsed_headers.items()) > 0:
-                headers = {}
-                for k, v in parsed_headers.items():
-                    headers[k] = v
-            raw_msg.headers = headers
+            raw_msg.headers = Headers.parse(hdrs)
 
         msg_data: Optional[bytes] = None
         if raw_msg.data:

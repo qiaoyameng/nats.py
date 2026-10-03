@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import List, Union
 
 from .aio.client import Client as NATS
+from .aio.headers import Headers
 
 
 async def connect(

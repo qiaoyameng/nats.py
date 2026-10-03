@@ -16,8 +16,9 @@ from __future__ import annotations
 import datetime
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
+from nats.aio.headers import Headers
 from nats.errors import Error, MsgAlreadyAckdError, NotJSMessageError
 
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ class Msg:
     subject: str = ""
     reply: str = ""
     data: bytes = b""
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[Headers] = None
 
     _metadata: Optional[Metadata] = None
     _ackd: bool = False
@@ -71,7 +72,7 @@ class Msg:
         NumPending = 10
 
     @property
-    def header(self) -> Optional[Dict[str, str]]:
+    def header(self) -> Optional[Headers]:
         """
         header returns the headers from a message.
         """
@@ -103,6 +104,18 @@ class Msg:
             raise Error("client not set")
 
         await self._client.publish(self.reply, data, headers=self.headers)
+
+    async def forward(self, subject: str) -> None:
+        """
+        forward re-publishes the message verbatim to ``subject``,
+        preserving the inline status line and every header value in the
+        original order.
+        """
+        if not self._client:
+            raise Error("client not set")
+        await self._client.publish(
+            subject, self.data, headers=self.headers
+        )
 
     async def ack(self) -> None:
         """

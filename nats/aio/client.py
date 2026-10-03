@@ -21,22 +21,15 @@ import json
 import logging
 import re
 import ssl
-import string
 import time
 from collections import UserString
 from dataclasses import dataclass
-from email.parser import BytesParser
 from io import BytesIO
 from pathlib import Path
 from random import shuffle
 from secrets import token_hex
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import ParseResult, urlparse
-
-try:
-    from fast_mail_parser import parse_email
-except ImportError:
-    parse_email = None
 
 import nats.js
 from nats import errors
@@ -51,6 +44,7 @@ from nats.protocol.parser import (
 )
 
 from .errors import ErrInvalidUserCredentials, ErrStaleConnection
+from .headers import Headers
 from .msg import Msg
 from .subscription import (
     DEFAULT_SUB_PENDING_BYTES_LIMIT,
@@ -285,7 +279,6 @@ class Client:
         self._flush_queue: Optional[asyncio.Queue[asyncio.Future[Any]]] = None
         self._flusher_task: Optional[asyncio.Task] = None
         self._flush_timeout: Optional[float] = 0
-        self._hdr_parser: BytesParser = BytesParser()
 
         # New style request/response
         self._resp_map: Dict[str, asyncio.Future] = {}
@@ -847,7 +840,7 @@ class Client:
         subject: str,
         payload: bytes = b"",
         reply: str = "",
-        headers: Optional[Dict[str, str]] = None,
+        headers: Optional[Union[Headers, Dict[str, Any]]] = None,
     ) -> None:
         """
         Publishes a NATS message.
@@ -920,7 +913,7 @@ class Client:
         reply: str,
         payload: bytes,
         payload_size: int,
-        headers: Optional[Dict[str, Any]],
+        headers: Optional[Union[Headers, Dict[str, Any]]],
     ) -> None:
         """
         Sends PUB command to the NATS server.
@@ -933,20 +926,13 @@ class Client:
         if headers is None:
             pub_cmd = prot_command.pub_cmd(subject, reply, payload)
         else:
-            hdr = bytearray()
-            hdr.extend(NATS_HDR_LINE)
-            hdr.extend(_CRLF_)
-            for k, v in headers.items():
-                key = k.strip()
-                if not key:
-                    # Skip empty keys
-                    continue
-                hdr.extend(key.encode())
-                hdr.extend(b": ")
-                value = v.strip()
-                hdr.extend(value.encode())
-                hdr.extend(_CRLF_)
-            hdr.extend(_CRLF_)
+            if not isinstance(headers, Headers):
+                # Normalize dicts (values may be strings or lists of
+                # strings) and sequences of (name, value) pairs.
+                headers = Headers(headers)
+            # encode() validates the fields and computes everything from
+            # the actual UTF-8 byte representation.
+            hdr = headers.encode()
             pub_cmd = prot_command.hpub_cmd(subject, reply, hdr, payload)
 
         self.stats["out_msgs"] += 1
@@ -1046,7 +1032,7 @@ class Client:
         payload: bytes = b"",
         timeout: float = 0.5,
         old_style: bool = False,
-        headers: Optional[Dict[str, Any]] = None,
+        headers: Optional[Union[Headers, Dict[str, Any]]] = None,
     ) -> Msg:
         """
         Implements the request/response pattern via pub/sub
@@ -1073,7 +1059,7 @@ class Client:
         subject: str,
         payload: bytes,
         timeout: float = 1,
-        headers: Optional[Dict[str, Any]] = None,
+        headers: Optional[Union[Headers, Dict[str, Any]]] = None,
     ) -> Msg:
         if self.is_draining_pubs:
             raise errors.ConnectionDrainingError
@@ -1655,92 +1641,15 @@ class Client:
             return header.get(nats.js.api.Header.DESCRIPTION)
         return None
 
-    async def _process_headers(self, headers) -> Optional[Dict[str, str]]:
+    async def _process_headers(self, headers) -> Optional[Headers]:
         if not headers:
             return None
 
-        hdr: Optional[Dict[str, str]] = None
-        raw_headers = headers[NATS_HDR_LINE_SIZE:]
-
-        # If the first character is an empty space, then this is
-        # an inline status message sent by the server.
-        #
-        # NATS/1.0 404\r\n\r\n
-        # NATS/1.0 503\r\n\r\n
-        # NATS/1.0 404 No Messages\r\n\r\n
-        #
-        # Note: it is possible to receive a message with both inline status
-        # and a set of headers.
-        #
-        # NATS/1.0 100\r\nIdle Heartbeat\r\nNats-Last-Consumer: 1016\r\nNats-Last-Stream: 1024\r\n\r\n
-        #
-        if raw_headers[0] == _SPC_BYTE_:
-            # Special handling for status messages.
-            line = headers[len(NATS_HDR_LINE) + 1:]
-            status = line[:STATUS_MSG_LEN]
-            desc = line[STATUS_MSG_LEN + 1:len(line) - _CRLF_LEN_ - _CRLF_LEN_]
-            stripped_status = status.strip().decode()
-
-            # Process as status only when it is a valid integer.
-            hdr = {}
-            if stripped_status.isdigit():
-                hdr[nats.js.api.Header.STATUS.value] = stripped_status
-
-            # Move the raw_headers to end of line
-            i = raw_headers.find(_CRLF_)
-            raw_headers = raw_headers[i + _CRLF_LEN_:]
-
-            if len(desc) > 0:
-                # Heartbeat messages can have both headers and inline status,
-                # check that there are no pending headers to be parsed.
-                i = desc.find(_CRLF_)
-                if i > 0:
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc[:i].decode()
-                    parsed_hdr = self._hdr_parser.parsebytes(
-                        desc[i + _CRLF_LEN_:]
-                    )
-                    for k, v in parsed_hdr.items():
-                        hdr[k] = v
-                else:
-                    # Just inline status...
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc.decode()
-
-        if not len(raw_headers) > _CRLF_LEN_:
-            return hdr
-
-        #
-        # Example header without status:
-        #
-        # NATS/1.0\r\nfoo: bar\r\nhello: world
-        #
-        raw_headers = headers[NATS_HDR_LINE_SIZE + _CRLF_LEN_:]
-        try:
-            if parse_email:
-                parsed_hdr = parse_email(raw_headers).headers
-            else:
-                parsed_hdr = {
-                    k.strip(): v.strip()
-                    for k, v in self._hdr_parser.parsebytes(raw_headers
-                                                            ).items()
-                }
-            if hdr:
-                hdr.update(parsed_hdr)
-            else:
-                hdr = parsed_hdr
-
-            if parse_email:
-                to_delete = []
-                for k in hdr.keys():
-                    if any(c in k for c in string.whitespace):
-                        to_delete.append(k)
-                for k in to_delete:
-                    del hdr[k]
-
-        except Exception as e:
-            await self._error_cb(e)
-            return hdr
-
-        return hdr or None
+        parse_errors: List[Exception] = []
+        parsed = Headers.parse(headers, on_error=parse_errors.append)
+        for err in parse_errors:
+            await self._error_cb(err)
+        return parsed
 
     async def _process_msg(
         self,

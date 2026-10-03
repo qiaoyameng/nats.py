@@ -237,3 +237,159 @@ class ProtocolParserTest(unittest.TestCase):
             self.assertEqual(ps.state, AWAITING_CONTROL_LINE)
             await ps.parse(b"\r\n\r\n")
             await ps.parse(b"\r\n\r\n")
+
+
+class HeaderParserTest(unittest.TestCase):
+    """Multi-value header parsing, split reads and message forwarding."""
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+
+    def _client(self):
+        from nats.aio.headers import Headers
+
+        nc = MockNatsClient()
+        nc.header_errors = []
+
+        async def on_err(err):
+            nc.header_errors.append(err)
+
+        nc._error_cb = on_err
+        nc.messages = []
+
+        async def process_msg(sid, subject, reply, payload, headers=None):
+            if headers is not None:
+                headers = Headers.parse(
+                    headers, on_error=nc.header_errors.append
+                )
+            nc.messages.append((subject, reply, payload, headers))
+
+        nc._process_msg = process_msg
+        return nc
+
+    @async_test
+    async def test_split_status_line_multi_value_and_plain_mix(self):
+        from nats.protocol import command as prot_command
+
+        nc = self._client()
+        ps = Parser(nc)
+
+        hdr_block = (
+            b"NATS/1.0 100\r\nIdle Heartbeat\r\n"
+            b"X: one\r\nx: two\r\n\r\n"
+        )
+        total = len(hdr_block)
+        hmsg = (
+            b"HMSG hs 1 hr %d %d\r\n" % (total, total)
+            + hdr_block + b"\r\n"
+        )
+        plain = b"MSG ps 1  5\r\nhello\r\n"
+        block = hmsg + plain
+
+        # Split the status line itself across two reads.
+        cut = hmsg.index(b"NATS/1.0 1") + len(b"NATS/1.0 1")
+        await ps.parse(block[:cut])
+        await ps.parse(block[cut:])
+
+        self.assertEqual(len(nc.messages), 2)
+        subject, reply, payload, headers = nc.messages[0]
+        self.assertEqual(subject, b"hs")
+        self.assertEqual(reply, b"hr")
+        self.assertEqual(payload, b"")
+
+        # Old mapping reads keep last-value semantics.
+        self.assertEqual(headers["X"], "two")
+        self.assertEqual(headers["Status"], "100")
+        self.assertEqual(headers["Description"], "Idle Heartbeat")
+        self.assertEqual(len(headers), 3)
+
+        # New full access exposes all values in original order.
+        self.assertEqual(headers.get_all("x"), ["one", "two"])
+        self.assertEqual(
+            headers.pairs(), [("X", "one"), ("x", "two")]
+        )
+
+        # Re-publishing forwards the exact wire headers.
+        wire = prot_command.hpub_cmd(
+            "forward", "", headers.encode(), payload
+        )
+        expected_hdr = (
+            b"NATS/1.0 100 Idle Heartbeat\r\n"
+            b"X: one\r\nx: two\r\n\r\n"
+        )
+        self.assertEqual(
+            wire,
+            b"HPUB forward  %d %d\r\n" % (
+                len(expected_hdr), len(expected_hdr)
+            ) + expected_hdr + b"\r\n",
+        )
+
+        # The trailing plain message in the same chunk still arrives.
+        subject, reply, payload, headers = nc.messages[1]
+        self.assertEqual(subject, b"ps")
+        self.assertEqual(payload, b"hello")
+        self.assertIsNone(headers)
+        self.assertEqual(nc.header_errors, [])
+
+    @async_test
+    async def test_bad_header_does_not_swallow_following_messages(self):
+        nc = self._client()
+        ps = Parser(nc)
+
+        bad_hdr = b"NATS/1.0\r\nGood: 1\r\nBROKEN_LINE\r\n\r\n"
+        bad_hmsg = (
+            b"HMSG a 1  %d %d\r\n" % (len(bad_hdr), len(bad_hdr))
+            + bad_hdr + b"\r\n"
+        )
+        good = b"MSG b 1  2\r\nhi\r\n"
+        await ps.parse(bad_hmsg + good)
+
+        self.assertEqual([m[0] for m in nc.messages], [b"a", b"b"])
+        bad_msg = nc.messages[0]
+        self.assertEqual(bad_msg[3].pairs(), [("Good", "1")])
+        self.assertEqual(nc.messages[1][2], b"hi")
+        self.assertEqual(len(nc.header_errors), 1)
+
+    @async_test
+    async def test_message_dispatch_error_keeps_parsing_chunk(self):
+        nc = MockNatsClient()
+        errors = []
+
+        async def on_err(err):
+            errors.append(err)
+
+        nc._error_cb = on_err
+
+        calls = []
+
+        async def boom(sid, subject, reply, payload, headers=None):
+            calls.append(subject)
+            if subject == b"bad":
+                raise RuntimeError("kaboom")
+
+        nc._process_msg = boom
+        ps = Parser(nc)
+        block = (
+            b"MSG bad 1  1\r\nx\r\n"
+            b"MSG good 1  1\r\ny\r\n"
+        )
+        await ps.parse(block)
+        self.assertEqual(calls, [b"bad", b"good"])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+
+    @async_test
+    async def test_utf8_header_lengths(self):
+        nc = self._client()
+        ps = Parser(nc)
+
+        hdr_block = "NATS/1.0\r\n\u591a: \u503c\r\n\r\n".encode("utf-8")
+        total = len(hdr_block)
+        data = (
+            b"HMSG u 1  %d %d\r\n" % (total, total)
+            + hdr_block + b"\r\n"
+        )
+        await ps.parse(data)
+        headers = nc.messages[0][3]
+        self.assertEqual(headers["\u591a"], "\u503c")
+        self.assertEqual(headers.encode(), hdr_block)
