@@ -8,6 +8,7 @@ import re
 import string
 import tempfile
 import time
+import types
 import unittest
 import uuid
 from hashlib import sha256
@@ -18,7 +19,9 @@ import pytest
 from nats.aio.client import Client as NATS
 from nats.aio.errors import *
 from nats.aio.msg import Msg
+from nats.aio.subscription import Subscription
 from nats.errors import *
+from nats.js.client import JetStreamContext
 from nats.js.errors import *
 from tests.utils import *
 
@@ -1184,6 +1187,257 @@ class PullSubscribeTest(SingleJetStreamServerTestCase):
         assert info.num_pending == 0
 
         await nc.close()
+
+
+def _business_msg(data: bytes) -> Msg:
+    return Msg(_client=None, subject="deliver", data=data)
+
+
+def _heartbeat_msg() -> Msg:
+    return Msg(
+        _client=None,
+        subject="deliver",
+        headers={
+            "Status": "100",
+            "Description": "Idle Heartbeat",
+        },
+    )
+
+
+def _status_msg(code: str, description: str = "") -> Msg:
+    return Msg(
+        _client=None,
+        subject="deliver",
+        headers={
+            "Status": code,
+            "Description": description,
+        },
+    )
+
+
+class _FakePullConnection:
+    """
+    Fake NATS connection that records the pull requests published by a
+    PullSubscription and replays scripted deliveries into the pending
+    queue of the subscription.
+    """
+
+    def __init__(self):
+        self.is_closed = False
+        self.requests = []
+        self._rounds = []
+        self.sub = None
+
+    def script(self, deliveries):
+        # Messages delivered by the server in response to the next request.
+        self._rounds.append(deliveries)
+
+    async def publish(self, subject, payload=b"", reply=""):
+        request = json.loads(payload.decode())
+        self.requests.append(request)
+        deliveries = self._rounds.pop(0) if self._rounds else []
+        for msg in deliveries:
+            self.sub._pending_queue.put_nowait(msg)
+            self.sub._pending_size += len(msg.data)
+
+
+class PullSubscriptionWaitFullTestCase(unittest.TestCase):
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+
+    def _make_pull_subscription(self):
+        nc = _FakePullConnection()
+        sub = Subscription(conn=nc, subject="deliver")
+        nc.sub = sub
+        js = types.SimpleNamespace(_prefix="$JS.API", _nc=nc)
+        pull = JetStreamContext.PullSubscription(
+            js=js,
+            sub=sub,
+            stream="TEST",
+            consumer="durable",
+            deliver=b"_INBOX.deliver",
+        )
+        return pull, sub, nc
+
+    @staticmethod
+    def _buffer(sub, msg):
+        sub._pending_queue.put_nowait(msg)
+        sub._pending_size += len(msg.data)
+
+    @async_test
+    async def test_wait_full_partial_rounds_until_batch_filled(self):
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([
+            _business_msg(b"n:1"),
+            _business_msg(b"n:2"),
+            _heartbeat_msg(),
+            _status_msg("404", "No Messages"),
+        ])
+        nc.script([
+            _business_msg(b"n:3"),
+            _status_msg("408", "Request Timeout"),
+        ])
+        nc.script([
+            _business_msg(b"n:4"),
+            _business_msg(b"n:5"),
+        ])
+
+        msgs = await pull.fetch(5, timeout=2, wait_full=True)
+        assert [msg.data for msg in msgs
+                ] == [b"n:1", b"n:2", b"n:3", b"n:4", b"n:5"]
+
+        # One request per round, each asking only for the remaining quota.
+        assert len(nc.requests) == 3
+        assert [req["batch"] for req in nc.requests] == [5, 3, 2]
+
+        # Every request is scoped to the overall deadline computed from
+        # the start of the call, never extending it.
+        expires = [req["expires"] for req in nc.requests]
+        assert all(0 < exp <= 2 * 1_000_000_000 for exp in expires)
+        assert expires[0] >= expires[1] >= expires[2]
+        assert sub._pending_queue.empty()
+
+    @async_test
+    async def test_wait_full_uses_buffered_messages_first(self):
+        pull, sub, nc = self._make_pull_subscription()
+        # Leftovers from previous fetches: business messages and a stale
+        # status message that must not count towards the batch.
+        self._buffer(sub, _business_msg(b"buf:1"))
+        self._buffer(sub, _status_msg("404", "No Messages"))
+        self._buffer(sub, _business_msg(b"buf:2"))
+        nc.script([
+            _business_msg(b"n:1"),
+            _business_msg(b"n:2"),
+        ])
+
+        msgs = await pull.fetch(4, timeout=1, wait_full=True)
+        assert [msg.data for msg in msgs
+                ] == [b"buf:1", b"buf:2", b"n:1", b"n:2"]
+
+        # Only the missing quota is requested from the server.
+        assert len(nc.requests) == 1
+        assert nc.requests[0]["batch"] == 2
+        assert sub._pending_queue.empty()
+
+    @async_test
+    async def test_wait_full_never_returns_more_than_batch(self):
+        pull, sub, nc = self._make_pull_subscription()
+        for i in range(5):
+            self._buffer(sub, _business_msg(b"buf:%d" % i))
+
+        # The buffer alone fills the batch: no request is made and the
+        # unconsumed messages stay buffered.
+        msgs = await pull.fetch(3, timeout=1, wait_full=True)
+        assert [msg.data for msg in msgs] == [b"buf:0", b"buf:1", b"buf:2"]
+        assert nc.requests == []
+        assert sub._pending_queue.qsize() == 2
+        assert sub._pending_queue.get_nowait().data == b"buf:3"
+        assert sub._pending_queue.get_nowait().data == b"buf:4"
+
+        # A server delivering more than the remaining quota does not
+        # overflow the batch either; the extra message stays buffered.
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([
+            _business_msg(b"n:1"),
+            _business_msg(b"n:2"),
+            _business_msg(b"n:3"),
+        ])
+        msgs = await pull.fetch(2, timeout=1, wait_full=True)
+        assert [msg.data for msg in msgs] == [b"n:1", b"n:2"]
+        assert len(nc.requests) == 1
+        assert nc.requests[0]["batch"] == 2
+        assert sub._pending_queue.qsize() == 1
+        assert sub._pending_queue.get_nowait().data == b"n:3"
+
+    @async_test
+    async def test_wait_full_expiry_returns_partial(self):
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([
+            _business_msg(b"n:1"),
+            _heartbeat_msg(),
+            _business_msg(b"n:2"),
+            _status_msg("408", "Request Timeout"),
+        ])
+        nc.script([
+            _heartbeat_msg(),
+            _status_msg("404", "No Messages"),
+        ])
+        # No further deliveries: the last request expires client side.
+
+        start = time.monotonic()
+        msgs = await pull.fetch(5, timeout=0.5, wait_full=True)
+        elapsed = time.monotonic() - start
+
+        # Partial data is returned once the overall deadline expires;
+        # heartbeats and status messages never counted towards the batch.
+        assert [msg.data for msg in msgs] == [b"n:1", b"n:2"]
+        assert elapsed >= 0.5
+        assert elapsed < 2
+
+        # The 'Request Timeout' and 'No Messages' statuses triggered new
+        # requests for the remaining quota without resetting the deadline.
+        assert [req["batch"] for req in nc.requests] == [5, 3, 3]
+        expires = [req["expires"] for req in nc.requests]
+        assert all(0 < exp <= 0.5 * 1_000_000_000 for exp in expires)
+        assert expires[0] >= expires[1] >= expires[2]
+
+    @async_test
+    async def test_wait_full_expiry_without_messages_raises(self):
+        # The server responded (heartbeats/status) but no business
+        # messages arrived: same convention as fetch, FetchTimeoutError.
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([_heartbeat_msg(), _status_msg("404", "No Messages")])
+        with pytest.raises(nats.js.errors.FetchTimeoutError):
+            await pull.fetch(3, timeout=0.3, wait_full=True)
+
+        # No response at all: plain timeout error as usual.
+        pull, sub, nc = self._make_pull_subscription()
+        start = time.monotonic()
+        with pytest.raises(nats.errors.TimeoutError) as err:
+            await pull.fetch(3, timeout=0.3, wait_full=True)
+        assert not isinstance(err.value, nats.js.errors.FetchTimeoutError)
+        assert time.monotonic() - start >= 0.3
+
+    @async_test
+    async def test_wait_full_cancel_leaves_no_background_requests(self):
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([_business_msg(b"n:1")])
+
+        task = asyncio.create_task(pull.fetch(10, timeout=30,
+                                              wait_full=True))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # A single request was in flight and cancelling the fetch does
+        # not leave any background task pulling more messages.
+        assert len(nc.requests) == 1
+        assert nc.requests[0]["batch"] == 10
+        await asyncio.sleep(0.1)
+        assert len(nc.requests) == 1
+
+    @async_test
+    async def test_fetch_without_wait_full_returns_partial_early(self):
+        pull, sub, nc = self._make_pull_subscription()
+        nc.script([
+            _business_msg(b"n:1"),
+            _business_msg(b"n:2"),
+            _status_msg("404", "No Messages"),
+        ])
+
+        start = time.monotonic()
+        msgs = await pull.fetch(5, timeout=2)
+        elapsed = time.monotonic() - start
+
+        # Default behavior is unchanged: a partial batch is returned as
+        # soon as the server reports there are no more messages.
+        assert [msg.data for msg in msgs] == [b"n:1", b"n:2"]
+        assert elapsed < 1
+        assert len(nc.requests) == 1
+        assert nc.requests[0]["batch"] == 5
+        assert nc.requests[0]["no_wait"] == True
 
 
 class JSMTest(SingleJetStreamServerTestCase):

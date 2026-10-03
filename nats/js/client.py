@@ -1079,6 +1079,7 @@ class JetStreamContext(JetStreamManager):
             batch: int = 1,
             timeout: Optional[float] = 5,
             heartbeat: Optional[float] = None,
+            wait_full: bool = False,
         ) -> List[Msg]:
             """
             fetch makes a request to JetStream to be delivered a set of messages.
@@ -1086,6 +1087,16 @@ class JetStreamContext(JetStreamManager):
             :param batch: Number of messages to fetch from server.
             :param timeout: Max duration of the fetch request before it expires.
             :param heartbeat: Idle Heartbeat interval in seconds for the fetch request.
+            :param wait_full: When enabled, the fetch keeps requesting the
+                remaining messages from the server until the whole batch is
+                filled or the overall timeout (computed from the start of the
+                call) expires.  Already buffered messages are used first,
+                heartbeats and status messages do not count towards the batch,
+                and a 'No Messages' or expired request from the server does not
+                reset the deadline.  On expiry any messages received so far are
+                returned; if none were received the usual timeout error is
+                raised.  Disabled by default, preserving the previous behavior
+                of returning as soon as a partial batch is available.
 
             ::
 
@@ -1116,6 +1127,9 @@ class JetStreamContext(JetStreamManager):
                 raise ValueError("nats: invalid batch size")
             if timeout is not None and timeout <= 0:
                 raise ValueError("nats: invalid fetch timeout")
+
+            if wait_full:
+                return await self._fetch_wait_full(batch, timeout, heartbeat)
 
             expires = int(
                 timeout * 1_000_000_000
@@ -1387,6 +1401,96 @@ class JetStreamContext(JetStreamManager):
                 raise FetchTimeoutError
 
             return msgs
+
+        async def _fetch_wait_full(
+            self,
+            batch: int,
+            timeout: Optional[float],
+            heartbeat: Optional[float] = None,
+        ) -> List[Msg]:
+            msgs: List[Msg] = []
+            queue = self._sub._pending_queue
+            start_time = time.monotonic()
+            got_any_response = False
+            needed = batch
+
+            # Use already buffered messages first, discarding any status
+            # messages left over from previous fetch requests.  Never take
+            # more than the requested batch from the buffer.
+            while needed > 0 and not queue.empty():
+                try:
+                    msg = queue.get_nowait()
+                    self._sub._pending_size -= len(msg.data)
+                except asyncio.QueueEmpty:
+                    break
+                status = JetStreamContext.is_status_msg(msg)
+                if status:
+                    continue
+                needed -= 1
+                msgs.append(msg)
+
+            # Pull the remaining quota from the server.  Each request is
+            # scoped to the time left until the overall deadline so that a
+            # 'No Messages' or expired request cannot extend the total wait.
+            while needed > 0:
+                deadline = JetStreamContext._time_until(timeout, start_time)
+                if deadline is not None and deadline <= 0:
+                    break
+
+                next_req = {}
+                next_req["batch"] = needed
+                if deadline:
+                    next_req["expires"] = int(
+                        deadline * 1_000_000_000
+                    ) - 100_000
+                    if next_req["expires"] <= 0:
+                        break
+                if heartbeat:
+                    next_req["idle_heartbeat"] = int(
+                        heartbeat * 1_000_000_000
+                    )  # to nanoseconds
+
+                await self._nc.publish(
+                    self._nms,
+                    json.dumps(next_req).encode(),
+                    self._deliver,
+                )
+
+                request_done = False
+                while needed > 0 and not request_done:
+                    deadline = JetStreamContext._time_until(
+                        timeout, start_time
+                    )
+                    if deadline is not None and deadline <= 0:
+                        break
+                    try:
+                        msg = await self._sub.next_msg(timeout=deadline)
+                    except asyncio.TimeoutError:
+                        # The overall deadline has been reached.
+                        break
+
+                    status = JetStreamContext.is_status_msg(msg)
+                    if JetStreamContext._is_heartbeat(status):
+                        # Heartbeats do not count towards the batch quota.
+                        got_any_response = True
+                        continue
+                    if JetStreamContext._is_processable_msg(status, msg):
+                        needed -= 1
+                        msgs.append(msg)
+                        continue
+
+                    # Temporary status (e.g. no messages or request
+                    # timeout): the current request is done server side,
+                    # so issue a new one for the remaining quota without
+                    # resetting the overall deadline.
+                    got_any_response = True
+                    request_done = True
+
+            if msgs:
+                return msgs
+            if got_any_response:
+                raise FetchTimeoutError
+            raise nats.errors.TimeoutError
 
     ######################
     #                    #
