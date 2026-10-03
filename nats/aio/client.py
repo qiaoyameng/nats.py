@@ -23,7 +23,7 @@ import re
 import ssl
 import string
 import time
-from collections import UserString
+from collections import UserString, deque
 from dataclasses import dataclass
 from email.parser import BytesParser
 from io import BytesIO
@@ -224,6 +224,40 @@ async def _default_error_callback(ex: Exception) -> None:
     _logger.error("nats: encountered error", exc_info=ex)
 
 
+@dataclass
+class _FlushBarrier:
+    """
+    Shared flush barrier backed by a single PING roundtrip.
+
+    Multiple flush() callers whose data had entered the send queue by the
+    time the PING is written can share one PING/PONG roundtrip.  ``mark`` is
+    the send watermark (bytes handed to the transport) that the PING covers:
+    a waiter only completes once every byte up to ``mark`` has been
+    acknowledged, so later writes can never complete early off an older
+    PONG.  ``generation`` binds the barrier to the connection on which its
+    PING was written.
+    """
+    future: asyncio.Future
+    mark: int = 0
+    generation: int = -1
+
+
+@dataclass
+class _PingRecord:
+    """
+    Tracks a single PING written to the transport.
+
+    ``future`` is the internal confirmation resolved when the matching PONG
+    arrives.  ``waiters`` holds the per-caller futures (each with its own
+    timeout/cancellation) that share this PING; callers attach and detach
+    themselves without ever touching ``future``.
+    """
+    future: asyncio.Future
+    mark: int
+    generation: int
+    waiters: List[asyncio.Future]
+
+
 class Client:
     """
     Asyncio based client for NATS.
@@ -251,7 +285,17 @@ class Client:
         self._ping_interval_task: Optional[asyncio.Task] = None
         self._pings_outstanding: int = 0
         self._pongs_received: int = 0
-        self._pongs: List[asyncio.Future] = []
+        # PINGs written on the current connection awaiting their PONG.
+        self._pings: deque[_PingRecord] = deque()
+        # PING counts of dead generations whose late PONGs must be consumed
+        # and ignored (generation -> number of outstanding PINGs).
+        self._stale_pings: "deque[Tuple[int, int]]" = deque()
+        # Monotonic count of bytes handed to the transport on the current
+        # connection; used as the flush barrier send watermark.
+        self._flushed_bytes: int = 0
+        # Bumped on every (re)connect and on disconnect so that a PONG from
+        # an old generation can never settle new barriers.
+        self._ping_generation: int = 0
         self._transport: Optional[Transport] = None
         self._err: Optional[Exception] = None
 
@@ -723,6 +767,11 @@ class Client:
             return
         self._status = Client.CLOSED
 
+        # The connection is gone for good: settle barriers from the old
+        # generation with ConnectionClosedError and invalidate any late
+        # PONG.
+        self._fail_flush_barriers(errors.ConnectionClosedError())
+
         # Kick the flusher once again so that Task breaks and avoid pending futures.
         await self._flush_pending()
 
@@ -1157,11 +1206,17 @@ class Client:
 
     async def flush(self, timeout: int = DEFAULT_FLUSH_TIMEOUT) -> None:
         """
-        Sends a ping to the server expecting a pong back ensuring
-        what we have written so far has made it to the server and
-        also enabling measuring of roundtrip time.
-        In case a pong is not returned within the allowed timeout,
-        then it will raise nats.errors.TimeoutError
+        Sends a ping to the server expecting a pong back, ensuring that
+        every byte already in the send queue when flush() was invoked has
+        reached the server.
+
+        Flush calls that confirm the same send watermark share a single
+        PING/PONG roundtrip.  Each caller keeps its own timeout and
+        cancellation: giving up detaches only that caller from the shared
+        PING confirmation, it never cancels the PING itself.
+
+        Raises nats.errors.FlushTimeoutError when the pong is not returned
+        in time and nats.errors.ConnectionClosedError when closed.
         """
         if timeout <= 0:
             raise errors.BadTimeoutError
@@ -1169,13 +1224,46 @@ class Client:
         if self.is_closed:
             raise errors.ConnectionClosedError
 
-        future: asyncio.Future = asyncio.Future()
+        loop = asyncio.get_running_loop()
+        generation = self._ping_generation
+
+        # Per-caller future.  It is attached as a waiter to the PING record
+        # by the flusher; cancellation/timeout detaches it without touching
+        # the shared confirmation used by other callers.
+        future: asyncio.Future = loop.create_future()
+        barrier = _FlushBarrier(future=future, generation=generation)
+        timer_handle: Optional[asyncio.TimerHandle] = None
+
+        def _on_timeout() -> None:
+            if not future.done():
+                future.set_exception(asyncio.TimeoutError())
+
+        timer_handle = loop.call_later(timeout, _on_timeout)
+
         try:
-            await self._send_ping(future)
-            await asyncio.wait_for(future, timeout)
+            assert self._flush_queue is not None
+            await self._flush_queue.put(barrier)
+            await future
+            return
         except asyncio.TimeoutError:
-            future.cancel()
+            self._detach_flush_waiter(future)
             raise errors.FlushTimeoutError
+        except asyncio.CancelledError:
+            self._detach_flush_waiter(future)
+            if not future.done():
+                future.cancel()
+            raise
+        except errors.ConnectionReconnectingError:
+            # The connection was lost before the PING was acknowledged and
+            # is reconnecting: old writes cannot be confirmed by the old
+            # PONG, so surface it as a flush timeout (callers may retry on
+            # the new connection).
+            raise errors.FlushTimeoutError
+        except errors.ConnectionClosedError:
+            raise
+        finally:
+            if timer_handle is not None:
+                timer_handle.cancel()
 
     @property
     def connected_url(self) -> Optional[ParseResult]:
@@ -1305,6 +1393,103 @@ class Client:
 
         except asyncio.CancelledError:
             pass
+
+    def _register_flush_barrier(self, barrier: _FlushBarrier) -> bool:
+        """
+        Binds a queued flush barrier to the PING that confirms its send
+        watermark.  Called from the flusher right after all data that had
+        entered the send queue has been handed to the transport.
+        Returns True when a new PING was written to the transport.
+        """
+        # A barrier enqueued on a connection that went down before the
+        # flusher got to it was already settled by the disconnect.
+        if barrier.generation != self._ping_generation:
+            return False
+
+        if barrier.future.done():
+            # Caller gave up (timeout/cancel) while queued for the flusher.
+            return False
+
+        barrier.mark = self._flushed_bytes
+
+        # Reuse the latest outstanding PING when its watermark covers this
+        # barrier.  PING watermarks are non-decreasing in sending order, so
+        # checking the most recent one is enough; data written *after* a
+        # PING (higher watermark) can never be confirmed by its earlier PONG.
+        record: Optional[_PingRecord] = None
+        if self._pings:
+            latest = self._pings[-1]
+            if (latest.generation == barrier.generation
+                    and latest.mark >= barrier.mark):
+                record = latest
+
+        if record is None:
+            # No PING covers this watermark yet: send a new one.
+            record = _PingRecord(
+                # Internal confirmation future for this PING; never handed
+                # to a caller directly, so it is never cancelled by a
+                # caller's timeout/cancellation.
+                future=asyncio.get_running_loop().create_future(),
+                mark=barrier.mark,
+                generation=barrier.generation,
+                waiters=[barrier.future],
+            )
+            self._pings.append(record)
+            assert self._transport is not None
+            self._transport.write(PING_PROTO)
+        else:
+            # Same watermark: share this PING.  Attach the caller's future
+            # so the PONG settles it; a caller that gives up first detaches
+            # itself without affecting anyone else.
+            record.waiters.append(barrier.future)
+            return False
+
+        return True
+
+    def _detach_flush_waiter(self, waiter: asyncio.Future) -> None:
+        """
+        Removes a flush caller that gave up (timeout/cancel) from the
+        shared PING record without affecting the shared confirmation.
+        """
+        for record in self._pings:
+            record.waiters[:] = [
+                w for w in record.waiters if w is not waiter
+            ]
+
+    def _fail_flush_barriers(self, err: Exception) -> None:
+        """
+        Settles every barrier that is waiting on the connection that just
+        went down: barriers still queued for the flusher as well as those
+        attached to PINGs that will never get a PONG.  A new ping generation
+        starts afterwards so a late PONG from the old connection can never
+        be matched to new waiters.
+        """
+        old_generation = self._ping_generation
+        self._ping_generation += 1
+
+        outstanding = len(self._pings)
+        while self._pings:
+            record = self._pings.popleft()
+            for waiter in record.waiters:
+                self._safe_set_exception(waiter, err)
+            self._safe_set_exception(record.future, err)
+
+        self._pings_outstanding = 0
+        self._flushed_bytes = 0
+        # Tombstone for the PINGs of the dead generation: PONGs answering
+        # them must be consumed and ignored rather than matched to waiters
+        # of the new generation.
+        self._stale_pings.append((old_generation, outstanding))
+
+    @staticmethod
+    def _safe_set_result(future: asyncio.Future, result: Any) -> None:
+        if future is not None and not future.done():
+            future.set_result(result)
+
+    @staticmethod
+    def _safe_set_exception(future: asyncio.Future, err: Exception) -> None:
+        if future is not None and not future.done():
+            future.set_exception(err)
 
     def _setup_server_pool(self, connect_url: Union[List[str]]) -> None:
         if isinstance(connect_url, str):
@@ -1455,6 +1640,10 @@ class Client:
         if self.options["allow_reconnect"] and (self.is_connected
                                                 or self.is_connecting):
             self._status = Client.RECONNECTING
+            # Settle the barriers of this connection against the disconnect;
+            # flush() callers either retry on the new generation or surface
+            # a timeout, and a late PONG can no longer reach them.
+            self._fail_flush_barriers(errors.ConnectionReconnectingError())
             self._ps.reset()
 
             if (self._reconnection_task is not None
@@ -1466,6 +1655,9 @@ class Client:
                 self._attempt_reconnect()
             )
         else:
+            # No reconnection will be attempted: fail outstanding barriers
+            # before closing so waiters get a definitive error.
+            self._fail_flush_barriers(errors.ConnectionClosedError())
             self._process_disconnect()
             self._err = e
             await self._close(Client.CLOSED, True)
@@ -1640,11 +1832,31 @@ class Client:
         """
         Process PONG sent by server.
         """
-        if len(self._pongs) > 0:
-            future = self._pongs.pop(0)
-            future.set_result(True)
+        # Consume PONGs belonging to connections that already went down so
+        # they can never settle waiters of the current generation.
+        while self._stale_pings:
+            generation, remaining = self._stale_pings[0]
+            if generation >= self._ping_generation:
+                break
+            if remaining > 1:
+                self._stale_pings[0] = (generation, remaining - 1)
+            else:
+                self._stale_pings.popleft()
             self._pongs_received += 1
-            self._pings_outstanding = 0
+            return
+
+        if not self._pings:
+            # Unexpected or late PONG (e.g. from an old generation): there
+            # is nothing waiting for it, so ignore it instead of raising and
+            # killing the read loop.
+            return
+
+        record = self._pings.popleft()
+        self._safe_set_result(record.future, True)
+        for waiter in record.waiters:
+            self._safe_set_result(waiter, True)
+        self._pongs_received += 1
+        self._pings_outstanding = 0
 
     def _is_control_message(self, data, header: Dict[str,
                                                      str]) -> Optional[str]:
@@ -2079,8 +2291,14 @@ class Client:
         self._reading_task = asyncio.get_running_loop().create_task(
             self._read_loop()
         )
-        self._pongs = []
+        # Start a fresh ping generation: nothing outstanding from the new
+        # connection yet, and a late PONG from the previous connection can
+        # never settle barriers created here.
+        self._pings = deque()
+        self._stale_pings = deque()
         self._pings_outstanding = 0
+        self._flushed_bytes = 0
+        self._ping_generation += 1
         self._ping_interval_task = asyncio.get_running_loop().create_task(
             self._ping_interval()
         )
@@ -2096,9 +2314,15 @@ class Client:
         assert self._transport, "Client.connect must be called first"
         if future is None:
             future = asyncio.Future()
-        self._pongs.append(future)
+        self._pings.append(
+            _PingRecord(
+                future=future,
+                mark=self._flushed_bytes,
+                generation=self._ping_generation,
+                waiters=[],
+            )
+        )
         self._transport.write(PING_PROTO)
-        self._pending_data_size += len(PING_PROTO)
         await self._flush_pending()
 
     async def _flusher(self) -> None:
@@ -2112,13 +2336,57 @@ class Client:
             if not self.is_connected or self.is_connecting:
                 break
 
-            future: asyncio.Future = await self._flush_queue.get()
+            item = await self._flush_queue.get()
 
             try:
+                # Drain everything that entered the send queue in this batch:
+                # all commands plus any flush barriers already enqueued share
+                # a single write (and, if needed, a single PING).
+                barriers: List[_FlushBarrier] = []
+                kicks: List[asyncio.Future] = []
+                if isinstance(item, _FlushBarrier):
+                    barriers.append(item)
+                else:
+                    kicks.append(item)
+
+                while True:
+                    try:
+                        queued = self._flush_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if isinstance(queued, _FlushBarrier):
+                        barriers.append(queued)
+                    else:
+                        kicks.append(queued)
+
                 if self._pending_data_size > 0:
+                    # Write all queued commands first so the PING that
+                    # confirms this watermark is ordered strictly after
+                    # every publish it covers.
                     self._transport.writelines(self._pending[:])
                     self._pending = []
+                    written = self._pending_data_size
                     self._pending_data_size = 0
+
+                    await self._transport.drain()
+                    self._flushed_bytes += written
+                else:
+                    await self._transport.drain()
+
+                # Register barriers in enqueue order after the data has been
+                # handed to the transport and the watermark advanced.  The
+                # first one writes the shared PING; later ones with the same
+                # watermark attach to it, while a barrier covering newer
+                # data writes another.
+                ping_written = False
+                for barrier in barriers:
+                    if self._register_flush_barrier(barrier):
+                        ping_written = True
+
+                # PINGs written by register_flush_barrier went straight to
+                # the transport; push them out now so they reach the server
+                # before any newer data.
+                if ping_written:
                     await self._transport.drain()
             except OSError as e:
                 await self._error_cb(e)
@@ -2128,9 +2396,10 @@ class Client:
                 # RuntimeError in case the event loop is closed
                 break
             finally:
-                # future might have been cancelled.  See issue #624
-                if not future.done():
-                    future.set_result(None)
+                for kick in kicks:
+                    # kick future might have been cancelled.  See issue #624
+                    if not kick.done():
+                        kick.set_result(None)
 
     async def _ping_interval(self) -> None:
         while True:
