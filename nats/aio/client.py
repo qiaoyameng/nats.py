@@ -30,7 +30,17 @@ from io import BytesIO
 from pathlib import Path
 from random import shuffle
 from secrets import token_hex
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 from urllib.parse import ParseResult, urlparse
 
 try:
@@ -964,6 +974,8 @@ class Client:
         max_msgs: int = 0,
         pending_msgs_limit: int = DEFAULT_SUB_PENDING_MSGS_LIMIT,
         pending_bytes_limit: int = DEFAULT_SUB_PENDING_BYTES_LIMIT,
+        key_cb: Optional[Callable[[Msg], Hashable]] = None,
+        concurrency: int = 1,
     ) -> Subscription:
         """
         subscribe registers interest in a given subject.
@@ -972,6 +984,16 @@ class Client:
 
         If a callback isn't provided, messages can be retrieved via an
         asynchronous iterator on the returned subscription object.
+
+        If `key_cb` is provided together with a callback, messages are
+        dispatched with keyed concurrency: `key_cb` maps each message to
+        a key, messages with different keys run their callbacks in
+        parallel bounded by `concurrency`, while messages sharing a key
+        are completed one at a time in receive order. Messages waiting
+        in per-key lanes keep counting towards the pending msgs/bytes
+        limits until their callback completes. Errors raised by `key_cb`
+        or by the message callback are reported through the connection
+        error callback without stalling the other keys.
         """
         if not subject or (" " in subject):
             raise errors.BadSubjectError
@@ -998,6 +1020,8 @@ class Client:
             max_msgs=max_msgs,
             pending_msgs_limit=pending_msgs_limit,
             pending_bytes_limit=pending_bytes_limit,
+            key_cb=key_cb,
+            concurrency=concurrency,
         )
 
         sub._start(self._error_cb)
@@ -1843,7 +1867,7 @@ class Client:
                         )
                     )
                     return
-                sub._pending_queue.put_nowait(msg)
+                sub._enqueue_msg(msg)
             except asyncio.QueueFull:
                 sub._pending_size -= len(msg.data)
                 await self._error_cb(
