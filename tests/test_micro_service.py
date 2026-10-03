@@ -543,6 +543,64 @@ class MicroServiceTest(SingleServerTestCase):
                 await svc.stop()
 
     @async_test
+    async def test_service_reset_periods(self):
+        nc = await nats.connect()
+
+        old_gate = asyncio.get_running_loop().create_future()
+        old_started = asyncio.get_running_loop().create_future()
+
+        async def handler(request: Request):
+            if request.data == b"old":
+                old_started.set_result(None)
+                await old_gate
+            await request.respond(b"ok")
+
+        svc = await add_service(
+            nc, ServiceConfig(name="reset-service", version="0.1.0")
+        )
+        await svc.add_endpoint(
+            EndpointConfig(
+                name="default", subject="reset.fn", handler=handler
+            )
+        )
+
+        old_task = asyncio.ensure_future(nc.request("reset.fn", b"old"))
+        await old_started
+
+        await svc.reset()
+
+        # New requests belong to the fresh period.
+        response = await nc.request("reset.fn", b"new", timeout=1)
+        assert response.data == b"ok"
+
+        current = svc.stats().endpoints[0]
+        assert current.num_requests == 1
+        assert current.num_errors == 0
+
+        # The previous summary cannot be taken until the old in-flight
+        # request settles into the old period.
+        pop_task = asyncio.ensure_future(svc.pop_previous_stats())
+        await asyncio.sleep(0)
+        assert not pop_task.done()
+
+        old_gate.set_result(None)
+        assert (await old_task).data == b"ok"
+        previous = await pop_task
+
+        assert previous.endpoints[0].num_requests == 1
+        assert previous.endpoints[0].num_errors == 0
+        assert (
+            previous.endpoints[0].average_processing_time
+            == previous.endpoints[0].processing_time
+        )
+
+        # Taking is one-shot and current counters stay in their own period.
+        assert await svc.pop_previous_stats() is None
+        assert svc.stats().endpoints[0].num_requests == 1
+
+        await svc.stop()
+
+    @async_test
     async def test_request_respond(self):
         sub_tests = {
             "empty_response": {
