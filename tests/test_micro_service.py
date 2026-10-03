@@ -1,5 +1,6 @@
 import asyncio
 import random
+import unittest
 
 import nats
 import nats.micro
@@ -776,3 +777,311 @@ class MicroServiceTest(SingleServerTestCase):
         await sub.unsubscribe()
         for svc in svcs:
             await svc.stop()
+
+
+class _FakeNUID:
+    def __init__(self):
+        self._count = 0
+
+    def next(self):
+        self._count += 1
+        return f"svc-id-{self._count}".encode()
+
+
+class _FakeSubscription:
+    async def unsubscribe(self):
+        pass
+
+    async def drain(self):
+        pass
+
+
+class _FakeStatsClient:
+    """Minimal client used to exercise period bookkeeping without a server."""
+
+    def __init__(self, fail_publish=False):
+        self._nuid = _FakeNUID()
+        self.fail_publish = fail_publish
+        self.published = []
+
+    async def subscribe(self, subject=None, cb=None, queue=None, **kwargs):
+        return _FakeSubscription()
+
+    async def publish(self, subject, data, headers=None):
+        if self.fail_publish:
+            raise ConnectionError("publish failed")
+        self.published.append((subject, data, headers))
+
+    async def flush(self):
+        pass
+
+
+def _make_msg(client, subject="ep", reply="reply", data=b"data"):
+    from nats.aio.msg import Msg
+    return Msg(_client=client, subject=subject, reply=reply, data=data)
+
+
+async def _make_service(client=None, stats_handler=None, handler=None):
+    client = client or _FakeStatsClient()
+    service = Service(
+        client,
+        ServiceConfig(
+            name="period_service",
+            version="0.1.0",
+            stats_handler=stats_handler,
+        ),
+    )
+    await service.start()
+
+    endpoint = Endpoint(
+        service,
+        EndpointConfig(
+            name="default",
+            subject="ep",
+            handler=handler,
+        ),
+    )
+    service._endpoints.append(endpoint)
+    return service, endpoint, client
+
+
+class StatsPeriodTest(unittest.TestCase):
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+
+    def tearDown(self):
+        self.loop.close()
+
+    @async_test
+    async def test_in_flight_request_settles_into_previous_period(self):
+        old_gate = asyncio.Future()
+        new_gate = asyncio.Future()
+        current_gate = {"gate": old_gate}
+
+        async def gated_handler(request: Request):
+            await current_gate["gate"]
+            await request.respond(b"ok")
+
+        service, endpoint, client = await _make_service(handler=gated_handler)
+
+        # An old request starts in period 0 and remains in flight.
+        old_task = asyncio.ensure_future(
+            endpoint._handle_request(_make_msg(client))
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(
+            service.stats().endpoints[0].num_requests, 1
+        )
+        self.assertIsNone(service.take_previous_stats())
+
+        # Rotate while the old request is still running. The current period
+        # must start empty and the previous period cannot be taken yet.
+        await service.reset()
+        self.assertEqual(
+            service.stats().endpoints[0].num_requests, 0
+        )
+        self.assertIsNone(service.take_previous_stats())
+
+        # A new request belongs to the new period.
+        current_gate["gate"] = new_gate
+        new_task = asyncio.ensure_future(
+            endpoint._handle_request(_make_msg(client))
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(
+            service.stats().endpoints[0].num_requests, 1
+        )
+        self.assertIsNone(service.take_previous_stats())
+
+        # Completing the new request first must not settle the old period.
+        new_gate.set_result(None)
+        await new_task
+        self.assertIsNone(service.take_previous_stats())
+
+        current_stats = service.stats().endpoints[0]
+        self.assertEqual(current_stats.num_requests, 1)
+        self.assertEqual(current_stats.num_errors, 0)
+        self.assertGreater(current_stats.processing_time, 0)
+        self.assertGreater(current_stats.average_processing_time, 0)
+
+        # The late old request settles into period 0.
+        old_gate.set_result(None)
+        await old_task
+
+        previous = service.take_previous_stats()
+        self.assertIsNotNone(previous)
+        previous_endpoint = previous.endpoints[0]
+        self.assertEqual(previous_endpoint.num_requests, 1)
+        self.assertEqual(previous_endpoint.num_errors, 0)
+        self.assertGreater(previous_endpoint.processing_time, 0)
+        self.assertGreater(
+            previous_endpoint.average_processing_time, 0
+        )
+
+        # Taking is a one-shot operation and the current period is untouched.
+        self.assertIsNone(service.take_previous_stats())
+        self.assertEqual(
+            service.stats().endpoints[0].num_requests, 1
+        )
+
+    @async_test
+    async def test_empty_period_without_requests(self):
+        async def handler(request: Request):
+            await request.respond(b"ok")
+
+        service, _, _ = await _make_service(handler=handler)
+
+        # A period without any requests settles immediately on reset.
+        await service.reset()
+        previous = service.take_previous_stats()
+        self.assertIsNotNone(previous)
+        empty = previous.endpoints[0]
+        self.assertEqual(empty.num_requests, 0)
+        self.assertEqual(empty.num_errors, 0)
+        self.assertEqual(empty.processing_time, 0)
+        self.assertEqual(empty.average_processing_time, 0)
+        self.assertEqual(empty.last_error, None)
+        self.assertIsNone(service.take_previous_stats())
+
+        # Consecutive empty periods are taken in closing order.
+        await service.reset()
+        await service.reset()
+        self.assertIsNotNone(service.take_previous_stats())
+        self.assertIsNotNone(service.take_previous_stats())
+        self.assertIsNone(service.take_previous_stats())
+
+    @async_test
+    async def test_failed_error_response_is_counted(self):
+        async def failing_handler(request: Request):
+            raise ServiceError("400", "boom")
+
+        client = _FakeStatsClient(fail_publish=True)
+        service, endpoint, _ = await _make_service(
+            client=client, handler=failing_handler
+        )
+
+        await endpoint._handle_request(_make_msg(client))
+
+        stats = service.stats().endpoints[0]
+        self.assertEqual(stats.num_requests, 1)
+        self.assertEqual(stats.num_errors, 1)
+        self.assertIn("publish failed", stats.last_error)
+
+        async def value_error_handler(request: Request):
+            raise ValueError("broken")
+
+        endpoint2 = Endpoint(
+            service,
+            EndpointConfig(
+                name="other",
+                subject="other",
+                handler=value_error_handler,
+            ),
+        )
+        service._endpoints.append(endpoint2)
+        client.fail_publish = False
+        await endpoint2._handle_request(_make_msg(client, subject="other"))
+
+        stats2 = service.stats().endpoints[1]
+        self.assertEqual(stats2.num_requests, 1)
+        self.assertEqual(stats2.num_errors, 1)
+        self.assertIn("ValueError", stats2.last_error)
+
+    @async_test
+    async def test_cancelled_request_settles_in_its_period(self):
+        gate = asyncio.Future()
+
+        async def blocked_handler(request: Request):
+            await gate
+
+        service, endpoint, client = await _make_service(handler=blocked_handler)
+
+        task = asyncio.ensure_future(
+            endpoint._handle_request(_make_msg(client))
+        )
+        await asyncio.sleep(0)
+
+        await service.reset()
+        self.assertIsNone(service.take_previous_stats())
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        previous = service.take_previous_stats()
+        self.assertIsNotNone(previous)
+        cancelled_stats = previous.endpoints[0]
+        self.assertEqual(cancelled_stats.num_requests, 1)
+        self.assertEqual(cancelled_stats.num_errors, 1)
+        self.assertIn("CancelledError", cancelled_stats.last_error)
+        self.assertGreater(cancelled_stats.processing_time, 0)
+
+        self.assertEqual(
+            service.stats().endpoints[0].num_requests, 0
+        )
+
+    @async_test
+    async def test_stats_handler_cannot_mutate_internal_counters(self):
+        def mutating_stats_handler(endpoint_stats):
+            endpoint_stats.num_requests = 9999
+            endpoint_stats.num_errors = 9999
+            endpoint_stats.processing_time = 9999
+            endpoint_stats.average_processing_time = 9999
+            endpoint_stats.last_error = "mutated"
+            return {"key": "value"}
+
+        async def handler(request: Request):
+            await request.respond(b"ok")
+
+        service, endpoint, client = await _make_service(
+            stats_handler=mutating_stats_handler, handler=handler
+        )
+
+        await endpoint._handle_request(_make_msg(client))
+
+        first = service.stats().endpoints[0]
+        self.assertEqual(first.data, {"key": "value"})
+        self.assertEqual(first.num_requests, 1)
+        self.assertEqual(first.num_errors, 0)
+        self.assertIsNone(first.last_error)
+
+        second = service.stats().endpoints[0]
+        self.assertEqual(second.data, {"key": "value"})
+        self.assertEqual(second.num_requests, 1)
+        self.assertEqual(second.num_errors, 0)
+        self.assertIsNone(second.last_error)
+
+    @async_test
+    async def test_periods_are_self_consistent(self):
+        async def error_handler(request: Request):
+            raise RuntimeError("nope")
+
+        service, endpoint, client = await _make_service(handler=error_handler)
+
+        for _ in range(3):
+            await endpoint._handle_request(_make_msg(client))
+
+        await service.reset()
+        previous = service.take_previous_stats()
+        self.assertIsNotNone(previous)
+        stats = previous.endpoints[0]
+        self.assertEqual(stats.num_requests, 3)
+        self.assertEqual(stats.num_errors, 3)
+        self.assertEqual(
+            stats.average_processing_time,
+            int(stats.processing_time / stats.num_requests),
+        )
+        self.assertIn("RuntimeError", stats.last_error)
+
+        async def ok_handler(request: Request):
+            await request.respond(b"ok")
+
+        endpoint._handler = ok_handler
+        await endpoint._handle_request(_make_msg(client))
+        current = service.stats().endpoints[0]
+        self.assertEqual(current.num_requests, 1)
+        self.assertEqual(current.num_errors, 0)
+        self.assertIsNone(current.last_error)

@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from asyncio import Event
+from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import (
     Any,
     AsyncContextManager,
     Callable,
+    Deque,
     Dict,
     List,
     Optional,
     Protocol,
+    Tuple,
     overload,
 )
 
@@ -221,13 +225,87 @@ class Endpoint:
         self._handler = config.handler
         self._metadata = config.metadata
 
-        self._num_requests = 0
-        self._num_errors = 0
-        self._processing_time = 0
-        self._average_processing_time = 0
-        self._last_error = None
-
         self._subscription: Optional[Subscription] = None
+
+        # Requests are counted against the period (generation) in which they
+        # started. A completed request always settles into the counters of the
+        # period captured at its start, so in-flight requests never leak into
+        # the period created by `reset`.
+        self._generation = service._generation
+        self._periods: Dict[int, _PeriodCounters] = {
+            self._generation: _PeriodCounters()
+        }
+
+    def _period(self, generation: int) -> _PeriodCounters:
+        """Return the counters for a period, creating them lazily.
+
+        Endpoints added after one or more resets have no data for older
+        generations, but they still take part in service bookkeeping:
+        missing periods behave as empty counters.
+        """
+        period = self._periods.get(generation)
+        if period is None:
+            period = _PeriodCounters()
+            self._periods[generation] = period
+        return period
+
+    def _begin_request(self) -> Tuple[int, int]:
+        generation = self._service._generation
+        period = self._period(generation)
+        period.num_requests += 1
+        period.num_in_flight += 1
+        return generation, time.perf_counter_ns()
+
+    def _finish_request(
+        self,
+        generation: int,
+        start_time: int,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        period = self._period(generation)
+        period.num_in_flight -= 1
+        period.processing_time += time.perf_counter_ns() - start_time
+
+        if error is not None:
+            period.num_errors += 1
+            period.last_error = repr(error)
+
+        self._service._promote_settled()
+
+    def _snapshot(self, generation: int) -> EndpointStats:
+        period = self._periods.get(generation)
+        if period is None or period.num_requests == 0:
+            num_requests = 0
+            num_errors = 0
+            processing_time = 0
+            average_processing_time = 0
+            last_error = None
+        else:
+            num_requests = period.num_requests
+            num_errors = period.num_errors
+            processing_time = period.processing_time
+            average_processing_time = int(processing_time / num_requests)
+            last_error = period.last_error
+
+        return EndpointStats(
+            name=self._name,
+            subject=self._subject,
+            queue_group=self._queue_group,
+            num_requests=num_requests,
+            num_errors=num_errors,
+            last_error=last_error,
+            processing_time=processing_time,
+            average_processing_time=average_processing_time,
+        )
+
+    def _start_period(self, generation: int) -> None:
+        """Open a new empty period on this endpoint."""
+        self._generation = generation
+        self._period(generation)
+
+    def _prune_period(self, generation: int) -> None:
+        """Drop the counters of a period after its summary has been taken."""
+        self._periods.pop(generation, None)
 
     async def _start(self) -> None:
         assert not self._subscription
@@ -243,38 +321,47 @@ class Endpoint:
         await self._subscription.unsubscribe()
         self._subscription = None
 
-    def _reset(self) -> None:
-        """Reset the endpoint statistics."""
-        self._num_requests = 0
-        self._num_errors = 0
-
-        self._processing_time = 0
-        self._average_processing_time = timedelta()
-
     async def _handle_request(self, msg: Msg) -> None:
         """Handle an endpoint message."""
-        start_time = time.perf_counter_ns()
-        self._num_requests += 1
+        generation, start_time = self._begin_request()
         request = Request(msg)
+        error: Optional[BaseException] = None
 
         try:
             await self._handler(request)
-        except Exception as error:
-            self._num_errors += 1
-            self._last_error = repr(error)
+        except asyncio.CancelledError:
+            # A cancelled request never completes successfully. It is still
+            # settled into the period it started in, then the cancellation is
+            # propagated to the caller unchanged.
+            error = asyncio.CancelledError()
+            raise
+        except Exception as handler_error:
+            error = handler_error
+            try:
+                if isinstance(handler_error, ServiceError):
+                    await request.respond_error(
+                        handler_error.code, handler_error.description
+                    )
+                else:
+                    await request.respond_error("500", repr(handler_error))
+            except Exception as respond_error:
+                # The handler failed and sending the error response itself
+                # failed as well; record that failure explicitly instead of
+                # crashing the subscription callback.
+                error = respond_error
+        finally:
+            self._finish_request(generation, start_time, error)
 
-            if isinstance(error, ServiceError):
-                await request.respond_error(error.code, error.description)
-            else:
-                await request.respond_error("500", repr(error))
 
-        current_time = time.perf_counter_ns()
-        elapsed_time = current_time - start_time
+@dataclass
+class _PeriodCounters:
+    """Mutable counters accumulated within a single stats period."""
 
-        self._processing_time += elapsed_time
-        self._average_processing_time = int(
-            self._processing_time / self._num_requests
-        )
+    num_requests: int = 0
+    num_errors: int = 0
+    num_in_flight: int = 0
+    processing_time: int = 0
+    last_error: Optional[str] = None
 
 
 @dataclass
@@ -658,7 +745,20 @@ class Service(AsyncContextManager):
         self._client = client
         self._subscriptions = {}
         self._endpoints = []
-        self._started = datetime.utcnow()
+
+        # Period bookkeeping. Every reset opens a new, monotonically numbered
+        # period (generation). Completed generations stay in `_closing` until
+        # every in-flight request that started in them has finished; they are
+        # then moved, in order, into `_settled` where their summary waits to
+        # be taken exactly once.
+        self._generation = 0
+        self._period_started: Dict[int, datetime] = {
+            0: datetime.utcnow()
+        }
+        self._closing: Deque[int] = deque()
+        self._settled: Deque[int] = deque()
+
+        self._started = self._period_started[0]
         self._stopped = Event()
         self._prefix = DEFAULT_PREFIX
 
@@ -672,6 +772,16 @@ class Service(AsyncContextManager):
     async def start(self) -> None:
         if self._subscriptions:
             return
+
+        # Re-initialize the first period in case the service was created some
+        # time before it actually started.
+        self._generation = 0
+        self._period_started = {0: datetime.utcnow()}
+        self._closing = deque()
+        self._settled = deque()
+        for endpoint in self._endpoints:
+            endpoint._periods = {0: _PeriodCounters()}
+            endpoint._generation = 0
 
         verb_request_handlers = {
             ServiceVerb.PING: self._handle_ping_request,
@@ -770,33 +880,13 @@ class Service(AsyncContextManager):
 
     def stats(self) -> ServiceStats:
         """
-        Returns the statistics for the service.
+        Returns the statistics for the current (active) period only.
+
+        Use `take_previous_stats` to retrieve and remove a fully settled
+        previous period. Previous periods which still have in-flight requests
+        are not reported here and are not yet available for taking.
         """
-        stats = ServiceStats(
-            id=self._id,
-            name=self._name,
-            version=self._version,
-            metadata=self._metadata,
-            endpoints=[
-                EndpointStats(
-                    name=endpoint._name,
-                    subject=endpoint._subject,
-                    queue_group=endpoint._queue_group,
-                    num_requests=endpoint._num_requests,
-                    num_errors=endpoint._num_errors,
-                    last_error=endpoint._last_error,
-                    processing_time=endpoint._processing_time,
-                    average_processing_time=endpoint._average_processing_time,
-                ) for endpoint in (self._endpoints or [])
-            ],
-            started=self._started,
-        )
-
-        if self._stats_handler:
-            for endpoint_stats in stats.endpoints:
-                endpoint_stats.data = self._stats_handler(endpoint_stats)
-
-        return stats
+        return self._build_stats(self._generation)
 
     def info(self) -> ServiceInfo:
         return ServiceInfo(
@@ -817,9 +907,93 @@ class Service(AsyncContextManager):
 
     async def reset(self) -> None:
         """
-        Resets all statistics for all endpoints on a service instance.
+        Start a new statistics period.
+
+        Only the period boundary is moved: the counters of the new period
+        start from zero, while requests which began in the previous period
+        and are still in flight continue to settle into that period once they
+        finish. The previous period becomes available through
+        `take_previous_stats` as soon as all of its in-flight requests have
+        completed (immediately if there were none).
         """
-        self._started = datetime.utcnow()
+        previous_generation = self._generation
+        new_generation = previous_generation + 1
+
+        self._generation = new_generation
+        new_started = datetime.utcnow()
+        self._period_started[new_generation] = new_started
+        self._started = new_started
+
+        for endpoint in self._endpoints:
+            endpoint._start_period(new_generation)
+
+        self._closing.append(previous_generation)
+        self._promote_settled()
+
+    def take_previous_stats(self) -> Optional[ServiceStats]:
+        """
+        Take and remove the summary of the oldest fully settled period.
+
+        Settled periods are returned in the order in which they were closed.
+        Returns `None` when no previous period is fully settled, including
+        when the previous period still has in-flight requests or when all
+        settled summaries have already been taken.
+        """
+        if not self._settled:
+            return None
+
+        generation = self._settled.popleft()
+        stats = self._build_stats(generation)
+
+        self._period_started.pop(generation, None)
+        for endpoint in self._endpoints:
+            endpoint._prune_period(generation)
+
+        return stats
+
+    # Backwards/naming-friendly aliases: taking the summary is a one-shot
+    # operation that also clears the stored period.
+    def pop_previous_stats(self) -> Optional[ServiceStats]:
+        """Alias of `take_previous_stats`."""
+        return self.take_previous_stats()
+
+    def _promote_settled(self) -> None:
+        """Move closed periods with no in-flight requests to the settled queue."""
+        while self._closing:
+            generation = self._closing[0]
+            if any(
+                endpoint._period(generation).num_in_flight > 0
+                for endpoint in self._endpoints
+            ):
+                break
+
+            self._closing.popleft()
+            self._settled.append(generation)
+
+    def _build_stats(self, generation: int) -> ServiceStats:
+        """Build an immutable snapshot of one period for every endpoint."""
+        stats = ServiceStats(
+            id=self._id,
+            name=self._name,
+            version=self._version,
+            metadata=self._metadata,
+            endpoints=[
+                endpoint._snapshot(generation)
+                for endpoint in (self._endpoints or [])
+            ],
+            started=self._period_started.get(
+                generation, self._started
+            ),
+        )
+
+        if self._stats_handler:
+            for endpoint_stats in stats.endpoints:
+                # Hand the extension callback a copy and keep only the data
+                # it returns. Mutating the snapshot must never reach internal
+                # counters or subsequent stats output.
+                endpoint_stats.data = self._stats_handler(replace(endpoint_stats))
+
+        return stats
 
     async def stop(self) -> None:
         if self._stopped.is_set():
