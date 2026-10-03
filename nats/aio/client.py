@@ -30,8 +30,8 @@ from io import BytesIO
 from pathlib import Path
 from random import shuffle
 from secrets import token_hex
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import ParseResult, urlparse
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
+from urllib.parse import ParseResult, urlparse, urlunparse
 
 try:
     from fast_mail_parser import parse_email
@@ -91,7 +91,54 @@ DEFAULT_MAX_FLUSHER_QUEUE_SIZE = 1024
 DEFAULT_FLUSH_TIMEOUT = 10  # in seconds
 DEFAULT_CONNECT_TIMEOUT = 2  # in seconds
 DEFAULT_DRAIN_TIMEOUT = 30  # in seconds
+DEFAULT_NATS_PORT = 4222
 MAX_CONTROL_LINE_SIZE = 1024
+
+
+def _bracket_bare_ipv6_authority(url: str) -> str:
+    """
+    Wraps a bare IPv6 literal in the URL authority in brackets so that
+    urlparse can tell the host from the port, e.g.
+    "nats://2001:db8::1:4222" becomes "nats://[2001:db8::1]:4222".
+    Already bracketed hosts and IPv4/hostname URLs are left untouched.
+    """
+    scheme_sep = "://"
+    if scheme_sep not in url:
+        return url
+    scheme, rest = url.split(scheme_sep, 1)
+    authority = rest.split("/", 1)[0]
+    if authority.count(":") < 2 or "[" in authority:
+        return url
+
+    userinfo = ""
+    hostport = authority
+    if "@" in authority:
+        userinfo, hostport = authority.rsplit("@", 1)
+        userinfo += "@"
+
+    # Prefer treating a trailing ":<digits>" segment as the port, but
+    # only when the remainder is a valid IPv6 address. Otherwise the
+    # digits are part of the address itself.
+    address = hostport
+    port_part = ""
+    tail = hostport.rsplit(":", 1)
+    if len(tail) == 2 and tail[1].isdigit():
+        candidate, candidate_port = tail
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ValueError:
+            candidate = ""
+        if candidate:
+            address = candidate
+            port_part = f":{candidate_port}"
+
+    try:
+        ipaddress.IPv6Address(address)
+    except ValueError:
+        return url
+
+    suffix = rest[len(authority):]
+    return f"{scheme}{scheme_sep}{userinfo}[{address}]{port_part}{suffix}"
 
 NATS_HDR_LINE = bytearray(b"NATS/1.0")
 NATS_HDR_LINE_SIZE = len(NATS_HDR_LINE)
@@ -125,6 +172,118 @@ class Srv:
     discovered: bool = False
     tls_name: Optional[str] = None
     server_version: Optional[str] = None
+    # evicted marks a discovered server that dropped out of the latest
+    # INFO connect_urls while it is still the active connection. It is
+    # kept until the connection is torn down and skipped for reconnects.
+    evicted: bool = False
+
+
+def _normalize_server_url(server_url: str, default_scheme: str = "nats") -> ParseResult:
+    """
+    Normalizes a user provided server URL into a ParseResult with an
+    explicit scheme and port. Userinfo is preserved since it may carry
+    per server credentials, but it is never part of the server identity.
+    """
+    url = server_url.strip()
+    if "://" not in url:
+        # Expand the scheme for the user, e.g. "localhost:4222".
+        url = f"{default_scheme}://{url}"
+
+    url = _bracket_bare_ipv6_authority(url)
+    uri = urlparse(url)
+    scheme = uri.scheme
+    if scheme not in ("nats", "tls", "ws", "wss"):
+        raise ValueError("nats: invalid scheme in server url")
+
+    port = uri.port
+    if port is None:
+        if scheme == "ws":
+            port = 80
+        elif scheme == "wss":
+            port = 443
+        else:
+            port = DEFAULT_NATS_PORT
+
+    hostname = uri.hostname
+    if hostname is None or hostname == "none":
+        raise ValueError("nats: invalid hostname in server url")
+
+    # Rebuild netloc so IPv6 hosts are bracketed and the default port
+    # is explicit. Keep any userinfo configured in the seed URL.
+    netloc_host = hostname
+    if ":" in hostname:
+        netloc_host = f"[{hostname}]"
+    auth = ""
+    if uri.username is not None:
+        auth = uri.username
+        if uri.password is not None:
+            auth += f":{uri.password}"
+        auth += "@"
+    netloc = f"{auth}{netloc_host}:{port}"
+
+    return urlparse(
+        urlunparse(
+            (
+                scheme,
+                netloc,
+                uri.path or "",
+                uri.params,
+                uri.query,
+                uri.fragment,
+            )
+        )
+    )
+
+
+def _server_id(uri: ParseResult) -> Tuple[str, str, int]:
+    """
+    Returns the stable identity of a server: scheme, hostname and port.
+
+    Authentication information, default port formatting and IPv6 bracket
+    notation are normalized away so that the same server advertised in
+    slightly different spellings is treated as the same candidate.
+    """
+    hostname = uri.hostname or ""
+    scheme = uri.scheme or "nats"
+    port = uri.port
+    if port is None:
+        if scheme == "ws":
+            port = 80
+        elif scheme == "wss":
+            port = 443
+        else:
+            port = DEFAULT_NATS_PORT
+    return (scheme, hostname.lower(), port)
+
+
+def _parse_discovered_url(
+    connect_url: str, scheme: str, tls_required: bool
+) -> ParseResult:
+    """
+    Builds the URL of a server learned through INFO connect_urls.
+
+    The scheme follows the current connection (tls:// for TLS clusters,
+    nats:// otherwise). Any userinfo present in an advertised URL is
+    dropped because credentials are not part of the server identity.
+    """
+    url = connect_url.strip()
+    if "://" not in url:
+        url = f"{scheme}://{url}"
+    url = _bracket_bare_ipv6_authority(url)
+    uri = urlparse(url)
+
+    port = uri.port
+    if port is None:
+        port = DEFAULT_NATS_PORT
+    hostname = uri.hostname
+    if hostname is None or hostname == "none":
+        raise ValueError("nats: invalid hostname in discovered url")
+
+    netloc_host = f"[{hostname}]" if ":" in hostname else hostname
+    effective_scheme = "tls" if tls_required and scheme != "wss" else scheme
+    return urlparse(
+        urlunparse((effective_scheme, f"{netloc_host}:{port}", "", "", "", ""))
+    )
 
 
 class ServerVersion:
@@ -359,6 +518,7 @@ class Client:
         pending_size: int = DEFAULT_PENDING_SIZE,
         flush_timeout: Optional[float] = None,
         ws_connection_headers: Optional[Dict[str, List[str]]] = None,
+        use_latest_info_discovery: bool = False,
     ) -> None:
         """
         Establishes a connection to NATS.
@@ -369,6 +529,12 @@ class Client:
         :param disconnected_cb: Callback to report disconnection from NATS.
         :param closed_cb: Callback to report when client stops reconnection to NATS.
         :param discovered_server_cb: Callback to report when a new server joins the cluster.
+        :param use_latest_info_discovery: When True, the servers discovered
+            via INFO connect_urls are reconciled against every INFO received:
+            servers absent from the latest list are dropped from the dynamic
+            candidates (the active connection is kept until it disconnects).
+            Explicitly configured seed servers are always retained. When
+            False (default), discovered servers are only ever added.
         :param pending_size: Max size of the pending buffer for publishing commands.
         :param flush_timeout: Max duration to wait for a forced flush to occur.
 
@@ -497,6 +663,7 @@ class Client:
         self.options["drain_timeout"] = drain_timeout
         self.options["tls_handshake_first"] = tls_handshake_first
         self.options["ws_connection_headers"] = ws_connection_headers
+        self.options["use_latest_info_discovery"] = use_latest_info_discovery
 
         if tls:
             self.options["tls"] = tls
@@ -1194,7 +1361,7 @@ class Client:
     def discovered_servers(self) -> List[ParseResult]:
         servers = []
         for srv in self._server_pool:
-            if srv.discovered:
+            if srv.discovered and not srv.evicted:
                 servers.append(srv.uri)
         return servers
 
@@ -1309,36 +1476,14 @@ class Client:
     def _setup_server_pool(self, connect_url: Union[List[str]]) -> None:
         if isinstance(connect_url, str):
             try:
-                if "nats://" in connect_url or "tls://" in connect_url:
-                    # Closer to how the Go client handles this.
-                    # e.g. nats://localhost:4222
-                    uri = urlparse(connect_url)
-                elif "ws://" in connect_url or "wss://" in connect_url:
-                    uri = urlparse(connect_url)
-                elif ":" in connect_url:
-                    # Expand the scheme for the user
-                    # e.g. localhost:4222
-                    uri = urlparse(f"nats://{connect_url}")
-                else:
-                    # Just use the endpoint with the default NATS port.
-                    # e.g. demo.nats.io
-                    uri = urlparse(f"nats://{connect_url}:4222")
-
-                # In case only endpoint with scheme was set.
-                # e.g. nats://demo.nats.io or localhost:
-                # the ws and wss do not need a default port as the transport will assume 80 and 443, respectively
-                if uri.port is None and uri.scheme not in ("ws", "wss"):
-                    uri = urlparse(f"nats://{uri.hostname}:4222")
+                uri = _normalize_server_url(connect_url)
             except ValueError:
                 raise errors.Error("nats: invalid connect url option")
-
-            if uri.hostname is None or uri.hostname == "none":
-                raise errors.Error("nats: invalid hostname in connect url")
             self._server_pool.append(Srv(uri))
         elif isinstance(connect_url, list):
             try:
                 for server in connect_url:
-                    uri = urlparse(server)
+                    uri = _normalize_server_url(server)
                     self._server_pool.append(Srv(uri))
             except ValueError:
                 raise errors.Error("nats: invalid connect url option")
@@ -1366,6 +1511,10 @@ class Client:
 
             now = time.monotonic()
             s = self._server_pool.pop(0)
+            if s.evicted and s is not self._current_server:
+                # Discovered server that dropped out of the latest INFO.
+                # Drop it instead of trying to reconnect to it.
+                continue
             if self.options["max_reconnect_attempts"] > 0:
                 if s.reconnects > self.options["max_reconnect_attempts"]:
                     # Discard server since already tried to reconnect too many times
@@ -1497,6 +1646,17 @@ class Client:
 
         if self.is_closed:
             return
+
+        if (self._current_server is not None
+                and self._current_server.evicted):
+            # The server we were connected to disappeared from the latest
+            # INFO set: retire it now that its connection is gone instead
+            # of reconnecting to it.
+            self._server_pool = [
+                srv
+                for srv in self._server_pool
+                if srv is not self._current_server
+            ]
 
         if "dont_randomize" not in self.options or not self.options[
                 "dont_randomize"]:
@@ -1908,42 +2068,115 @@ class Client:
         with latest updates from cluster to enable server discovery.
         """
         assert self._current_server, "Client.connect must be called first"
-        if "connect_urls" in info:
-            if info["connect_urls"]:
-                connect_urls = []
-                for connect_url in info["connect_urls"]:
-                    scheme = ""
-                    if self._current_server.uri.scheme == "tls":
-                        scheme = "tls"
-                    else:
-                        scheme = "nats"
+        if "connect_urls" not in info:
+            return
 
-                    uri = urlparse(f"{scheme}://{connect_url}")
-                    srv = Srv(uri)
-                    srv.discovered = True
+        use_latest = self.options.get("use_latest_info_discovery", False)
+        tls_required = bool(
+            self._server_info.get("tls_required", False)
+            or info.get("tls_required", False)
+        )
+        discovered_scheme = (
+            "tls" if self._current_server.uri.scheme == "tls" else "nats"
+        )
 
-                    # Check whether we should reuse the original hostname.
-                    if ("tls_required" in self._server_info
-                            and self._server_info["tls_required"]
-                            and self._host_is_ip(uri.hostname)):
-                        srv.tls_name = self._current_server.uri.hostname
+        # Build the freshly advertised set of dynamic servers.
+        advertised: Dict[Tuple[str, str, int], Srv] = {}
+        for connect_url in info["connect_urls"]:
+            uri = _parse_discovered_url(
+                connect_url, discovered_scheme, tls_required
+            )
+            srv = Srv(uri)
+            srv.discovered = True
 
-                    # Filter for any similar server in the server pool already.
-                    should_add = True
-                    for s in self._server_pool:
-                        if uri.netloc == s.uri.netloc:
-                            should_add = False
-                    if should_add:
-                        connect_urls.append(srv)
+            # Reuse the original hostname when the server advertises an
+            # IP literal over TLS, so certificate verification still works.
+            if tls_required and self._host_is_ip(uri.hostname):
+                srv.tls_name = self._current_server.uri.hostname
 
-                if self.options["dont_randomize"] is not True:
-                    shuffle(connect_urls)
-                for srv in connect_urls:
-                    self._server_pool.append(srv)
+            advertised.setdefault(_server_id(uri), srv)
 
-                if (not initial_connection and connect_urls
-                        and self._discovered_server_cb):
-                    await self._discovered_server_cb()
+        # Snapshot the effective candidate set before reconciling so that
+        # the callback only fires when it actually changes.
+        candidates_before = self._candidate_server_ids()
+
+        if not use_latest:
+            # Legacy behavior: discovered servers are only ever added.
+            known = {_server_id(s.uri) for s in self._server_pool}
+            new_servers = [
+                srv for key, srv in advertised.items() if key not in known
+            ]
+            if self.options.get("dont_randomize") is not True:
+                shuffle(new_servers)
+            for srv in new_servers:
+                self._server_pool.append(srv)
+        else:
+            self._reconcile_discovered_servers(advertised)
+
+        candidates_after = self._candidate_server_ids()
+        if (
+            not initial_connection
+            and candidates_before != candidates_after
+            and self._discovered_server_cb is not None
+        ):
+            await self._discovered_server_cb()
+
+    def _candidate_server_ids(self) -> FrozenSet[Tuple[str, str, int]]:
+        """
+        Returns the identities of the servers that are valid reconnect
+        candidates. The current server counts even when it has been
+        evicted from the dynamic set because the connection is still up.
+        """
+        ids = set()
+        for srv in self._server_pool:
+            if srv.evicted and srv is not self._current_server:
+                continue
+            ids.add(_server_id(srv.uri))
+        if self._current_server is not None:
+            ids.add(_server_id(self._current_server.uri))
+        return frozenset(ids)
+
+    def _reconcile_discovered_servers(
+        self,
+        advertised: Dict[Tuple[str, str, int], Srv],
+    ) -> None:
+        """
+        Reconciles the dynamic portion of the pool with the latest INFO
+        connect_urls. Seed servers are preserved, added servers get a
+        fresh Srv and removed discovered servers are dropped unless they
+        back the currently open connection, in which case they are
+        marked evicted and retired on disconnect.
+        """
+        retained: List[Srv] = []
+        for srv in self._server_pool:
+            key = _server_id(srv.uri)
+            if not srv.discovered:
+                # Explicitly configured seeds always stay.
+                retained.append(srv)
+                continue
+
+            if key not in advertised:
+                if srv is self._current_server:
+                    # Keep using the open connection, but do not
+                    # reconnect to it after it goes away.
+                    srv.evicted = True
+                    retained.append(srv)
+                continue
+
+            if srv is self._current_server and srv.evicted:
+                # The server rejoined while we were still connected to
+                # it: restore it as a first class dynamic candidate.
+                srv.evicted = False
+            retained.append(srv)
+
+        known = {_server_id(s.uri) for s in retained}
+        new_servers = [
+            srv for key, srv in advertised.items() if key not in known
+        ]
+        if self.options.get("dont_randomize") is not True:
+            shuffle(new_servers)
+        retained.extend(new_servers)
+        self._server_pool = retained
 
     def _host_is_ip(self, connect_url: Optional[str]) -> bool:
         if connect_url is None:
